@@ -25,12 +25,24 @@ interface Route {
 /**
  * Minimal path router with `:param` capture — enough for the REST surface here
  * without pulling in a framework. First match wins.
+ *
+ * Routes are indexed by `"METHOD:segmentCount"` so `match()` only inspects the
+ * small bucket of routes that share the same method and path depth, instead of
+ * scanning all ~35 registered routes on every request.
  */
 export class Router {
-  private readonly routes: Route[] = [];
+  /** Indexed buckets: key is `"METHOD:segmentCount"`. */
+  private readonly index = new Map<string, Route[]>();
 
   add(method: Method, pattern: string, handler: RouteHandler): this {
-    this.routes.push({ method, segments: split(pattern), handler });
+    const route: Route = { method, segments: split(pattern), handler };
+    const key = `${method}:${route.segments.length}`;
+    let bucket = this.index.get(key);
+    if (!bucket) {
+      bucket = [];
+      this.index.set(key, bucket);
+    }
+    bucket.push(route);
     return this;
   }
 
@@ -56,10 +68,11 @@ export class Router {
     pathname: string,
   ): { handler: RouteHandler; params: Record<string, string> } | null {
     const parts = split(pathname);
-    for (const route of this.routes) {
-      if (route.method !== method) continue;
-      if (route.segments.length !== parts.length) continue;
+    const key = `${method}:${parts.length}`;
+    const candidates = this.index.get(key);
+    if (!candidates) return null;
 
+    for (const route of candidates) {
       const params: Record<string, string> = {};
       let ok = true;
       for (let i = 0; i < route.segments.length; i++) {
