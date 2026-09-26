@@ -40,8 +40,10 @@ services:
       PROVIDER_LATENCY_MS: ${PROVIDER_LATENCY_MS:-0}
       RATE_LIMIT_PER_HOUR: ${RATE_LIMIT_PER_HOUR:-10000000}
       SERVICES: ${API_SERVER_1_SERVICES:-api}
+      NODE_OPTIONS: "--inspect=0.0.0.0:9229"
     ports:
       - "35678:3000"
+      - "9229:9229"
     depends_on:
       - db
       - redis
