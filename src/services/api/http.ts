@@ -22,13 +22,40 @@ export async function readRawBody(req: IncomingMessage): Promise<string> {
 }
 
 export async function readJsonBody(req: IncomingMessage): Promise<unknown> {
-  const raw = await readRawBody(req);
-  if (raw.trim() === "") return undefined;
-  try {
-    return JSON.parse(raw) as unknown;
-  } catch {
-    throw new HttpError(400, "malformed_json");
-  }
+  return new Promise<unknown>((resolve, reject) => {
+    // Read as UTF-8 strings directly: avoids the Buffer.concat + toString() copy
+    // that readRawBody pays. readRawBody is kept for webhook callers that need
+    // raw bytes for HMAC verification.
+    if (typeof req.setEncoding === "function") {
+      req.setEncoding("utf8");
+    }
+    let body = "";
+    let totalLength = 0;
+    const MAX_PAYLOAD_SIZE = 5 * 1024 * 1024;
+    req.on("data", (chunk: string | Buffer) => {
+      const str = typeof chunk === "string" ? chunk : chunk.toString("utf8");
+      totalLength += str.length;
+      if (totalLength > MAX_PAYLOAD_SIZE) {
+        if (typeof req.destroy === "function") req.destroy();
+        reject(new HttpError(413, "payload_too_large"));
+        return;
+      }
+      body += str;
+    });
+    req.on("end", () => {
+      const trimmed = body.trim();
+      if (!trimmed) {
+        resolve(undefined);
+        return;
+      }
+      try {
+        resolve(JSON.parse(trimmed) as unknown);
+      } catch {
+        reject(new HttpError(400, "malformed_json"));
+      }
+    });
+    req.on("error", reject);
+  });
 }
 
 export function sendJson(res: ServerResponse, status: number, body: unknown): void {
