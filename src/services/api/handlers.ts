@@ -420,7 +420,7 @@ export function createHandlers(deps: Deps) {
       messageIds.push(...chunkMessageIds);
     }
 
-    logger.info({ count: targets.length, priority: p }, "notification requested");
+    logger.debug({ count: targets.length, priority: p }, "notification requested");
     metrics.messagesPublished.inc({ channel: "api", priority: p }, targets.length);
 
     if (targets.length === 1) {
