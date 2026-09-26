@@ -13,3 +13,4 @@ badge/
 .codegraph/
 .agents/
 skills-lock.json
+profiling/results/
