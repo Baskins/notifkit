@@ -68,8 +68,16 @@ let deps: any;
 let h: any;
 // Short-TTL LRU so a hot key does not hit the DB on every request. Kept small
 // and invalidated on key change so a revoked key stops working promptly.
+interface CachedAuthKey {
+  projectId: string;
+  projectRateLimitRpm: number;
+  keyRole: "admin" | "read_only";
+  tokenHash: string;
+}
+
 const AUTH_CACHE_TTL_MS = 60_000;
-let authCache = new LRUCache<string, string>(1000, AUTH_CACHE_TTL_MS);
+let authCache = new LRUCache<string, CachedAuthKey>(1000, AUTH_CACHE_TTL_MS);
+let tokenHashToToken = new Map<string, string>();
 let authSubscriber: Redis | null = null;
 let router: Router;
 let apiRateLimiter: ApiRateLimiter;
@@ -490,14 +498,13 @@ export async function startApiServer() {
           keyRole = "admin";
         }
       } else {
-        const tokenHash = createHash("sha256").update(token).digest("hex");
-        const cached = authCache.get(tokenHash);
+        const cached = authCache.get(token);
         if (cached) {
-          const parts = cached.split(":");
-          projectId = parts[0];
-          projectRateLimitRpm = parseInt(parts[1] || "600", 10);
-          keyRole = parts[2] as "admin" | "read_only";
+          projectId = cached.projectId;
+          projectRateLimitRpm = cached.projectRateLimitRpm;
+          keyRole = cached.keyRole;
         } else {
+          const tokenHash = createHash("sha256").update(token).digest("hex");
           const rows = await db
             .select({
               id: projects.id,
@@ -515,7 +522,16 @@ export async function startApiServer() {
           projectId = rows[0]!.id;
           projectRateLimitRpm = rows[0]!.rateLimitRpm ?? 600;
           keyRole = rows[0]!.role;
-          authCache.set(tokenHash, `${projectId}:${projectRateLimitRpm}:${keyRole}`);
+          authCache.set(token, {
+            projectId,
+            projectRateLimitRpm,
+            keyRole,
+            tokenHash,
+          });
+          tokenHashToToken.set(tokenHash, token);
+          if (tokenHashToToken.size > 2000) {
+            tokenHashToToken.clear();
+          }
         }
       }
 
@@ -656,8 +672,14 @@ export async function startApiServer() {
     if (channel !== API_KEY_INVALIDATION_CHANNEL) return;
     if (tokenHash === "*") {
       authCache.clear();
+      tokenHashToToken.clear();
       apiRateLimiter?.clear();
     } else {
+      const token = tokenHashToToken.get(tokenHash);
+      if (token) {
+        authCache.delete(token);
+        tokenHashToToken.delete(tokenHash);
+      }
       authCache.delete(tokenHash);
     }
     logger.info({ tokenHash }, "api key cache invalidated");
@@ -872,7 +894,8 @@ export async function stopApiServer(): Promise<void> {
   }
   // These are module-scoped, so a restart in the same process must not inherit
   // the previous instance's cached auth or health.
-  authCache = new LRUCache<string, string>(1000, AUTH_CACHE_TTL_MS);
+  authCache = new LRUCache<string, CachedAuthKey>(1000, AUTH_CACHE_TTL_MS);
+  tokenHashToToken.clear();
   cachedHealth = null;
   if (sql) await sql.end();
   if (redis) await redis.disconnect();
