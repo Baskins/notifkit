@@ -18,6 +18,23 @@ declare module "ioredis" {
       maxReqs: number | string,
       ttl?: number | string,
     ): Promise<number>;
+    leaseApiRateLimit(
+      currentKey: string,
+      prevKey: string,
+      now: number | string,
+      window: number | string,
+      maxReqs: number | string,
+      requested: number | string,
+      ttl?: number | string,
+    ): Promise<number>;
+    leaseApiRateLimit1Key(
+      baseKey: string,
+      now: number | string,
+      window: number | string,
+      maxReqs: number | string,
+      requested: number | string,
+      ttl?: number | string,
+    ): Promise<number>;
     throttleProvider(
       key: string,
       now: number | string,
@@ -94,6 +111,54 @@ export const LUA_CHECK_API_RATE_LIMIT = `
   end
 
   return -1
+`;
+
+/**
+ * Sliding-window token leasing for high-throughput API rate limiting.
+ * Atomically checks available capacity and reserves up to N tokens in one round trip.
+ */
+export const LUA_LEASE_API_RATE_LIMIT = `
+  local currentKey = KEYS[1]
+  local prevKey = KEYS[2]
+  local now = tonumber(ARGV[1])
+  local window = tonumber(ARGV[2])
+  local maxReqs = tonumber(ARGV[3])
+  local requested = tonumber(ARGV[4]) or 1
+  local ttl = tonumber(ARGV[5]) or (math.ceil((window * 2) / 1000) + 60)
+
+  if not now or not window or window <= 0 then
+    return -1
+  end
+  if not maxReqs or maxReqs <= 0 then
+    return 0
+  end
+
+  if not prevKey then
+    local currentBucket = math.floor(now / window)
+    local prevBucket = currentBucket - 1
+    currentKey = KEYS[1] .. ":" .. currentBucket
+    prevKey = KEYS[1] .. ":" .. prevBucket
+  end
+
+  local currentCount = tonumber(redis.call("GET", currentKey) or "0")
+  local prevCount = tonumber(redis.call("GET", prevKey) or "0")
+
+  local timeIntoCurrent = now % window
+  local weight = (window - timeIntoCurrent) / window
+  local estimated = math.floor(prevCount * weight + currentCount)
+  local available = maxReqs - estimated
+
+  if available <= 0 then
+    return 0
+  end
+
+  local toGrant = math.min(requested, available)
+  local newCount = redis.call("INCRBY", currentKey, toGrant)
+  if newCount == toGrant then
+    redis.call("EXPIRE", currentKey, ttl)
+  end
+
+  return toGrant
 `;
 
 /**
@@ -209,6 +274,16 @@ export function registerCustomCommands(redis: Redis): void {
   redis.defineCommand("checkApiRateLimit1Key", {
     numberOfKeys: 1,
     lua: LUA_CHECK_API_RATE_LIMIT,
+  });
+
+  redis.defineCommand("leaseApiRateLimit", {
+    numberOfKeys: 2,
+    lua: LUA_LEASE_API_RATE_LIMIT,
+  });
+
+  redis.defineCommand("leaseApiRateLimit1Key", {
+    numberOfKeys: 1,
+    lua: LUA_LEASE_API_RATE_LIMIT,
   });
 
   redis.defineCommand("throttleProvider", {

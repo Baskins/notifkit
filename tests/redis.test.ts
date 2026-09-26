@@ -3,6 +3,7 @@ import {
   registerCustomCommands,
   RedisClient,
   LUA_CHECK_API_RATE_LIMIT,
+  LUA_LEASE_API_RATE_LIMIT,
   LUA_THROTTLE_PROVIDER,
   LUA_RELEASE_LOCK,
   LUA_RENEW_LOCK,
@@ -35,6 +36,14 @@ describe("Redis Pre-compiled Commands (defineCommand)", () => {
       expect(definedCommands.has("checkApiRateLimit1Key")).toBe(true);
       expect(definedCommands.get("checkApiRateLimit1Key")?.numberOfKeys).toBe(1);
       expect(definedCommands.get("checkApiRateLimit1Key")?.lua).toBe(LUA_CHECK_API_RATE_LIMIT);
+
+      expect(definedCommands.has("leaseApiRateLimit")).toBe(true);
+      expect(definedCommands.get("leaseApiRateLimit")?.numberOfKeys).toBe(2);
+      expect(definedCommands.get("leaseApiRateLimit")?.lua).toBe(LUA_LEASE_API_RATE_LIMIT);
+
+      expect(definedCommands.has("leaseApiRateLimit1Key")).toBe(true);
+      expect(definedCommands.get("leaseApiRateLimit1Key")?.numberOfKeys).toBe(1);
+      expect(definedCommands.get("leaseApiRateLimit1Key")?.lua).toBe(LUA_LEASE_API_RATE_LIMIT);
 
       expect(definedCommands.has("throttleProvider")).toBe(true);
       expect(definedCommands.get("throttleProvider")?.numberOfKeys).toBe(1);
@@ -73,6 +82,8 @@ describe("Redis Pre-compiled Commands (defineCommand)", () => {
       try {
         expect(typeof client.native.checkApiRateLimit).toBe("function");
         expect(typeof client.native.checkApiRateLimit1Key).toBe("function");
+        expect(typeof client.native.leaseApiRateLimit).toBe("function");
+        expect(typeof client.native.leaseApiRateLimit1Key).toBe("function");
         expect(typeof client.native.throttleProvider).toBe("function");
         expect(typeof client.native.releaseLock).toBe("function");
         expect(typeof client.native.renewLock).toBe("function");
@@ -89,6 +100,10 @@ describe("Redis Pre-compiled Commands (defineCommand)", () => {
       expect(LUA_CHECK_API_RATE_LIMIT).toContain('redis.call("INCR"');
       expect(LUA_CHECK_API_RATE_LIMIT).toContain('redis.call("EXPIRE"');
       expect(LUA_CHECK_API_RATE_LIMIT).toContain("math.floor(prevCount * weight + currentCount)");
+
+      expect(LUA_LEASE_API_RATE_LIMIT).toContain('redis.call("INCRBY"');
+      expect(LUA_LEASE_API_RATE_LIMIT).toContain('redis.call("EXPIRE"');
+      expect(LUA_LEASE_API_RATE_LIMIT).toContain("math.floor(prevCount * weight + currentCount)");
 
       expect(LUA_THROTTLE_PROVIDER).toContain("redis.call('ZREMRANGEBYSCORE'");
       expect(LUA_THROTTLE_PROVIDER).toContain("redis.call('ZCARD'");
