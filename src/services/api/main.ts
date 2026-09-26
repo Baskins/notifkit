@@ -27,6 +27,7 @@ import { transportRegistry } from "@/transport/index.js";
 import type { Redis } from "@/redis/index.js";
 import { z } from "zod";
 import { getMetricsRegistry } from "@/metrics/index.js";
+import { ApiRateLimiter } from "@/rate-limiter/index.js";
 
 /** Pub/sub channel used to drop a cached API key across every API process. */
 export const API_KEY_INVALIDATION_CHANNEL = "apikey.invalidated";
@@ -71,6 +72,7 @@ const AUTH_CACHE_TTL_MS = 60_000;
 let authCache = new LRUCache<string, string>(1000, AUTH_CACHE_TTL_MS);
 let authSubscriber: Redis | null = null;
 let router: Router;
+let apiRateLimiter: ApiRateLimiter;
 
 export function extractAuthToken(req: Pick<IncomingMessage, "headers">): string | undefined {
   const authHeader = req.headers["authorization"];
@@ -249,6 +251,11 @@ export async function startApiServer() {
   }
 
   redis = new RedisClient({ url: config.REDIS_URL, name: "api", logger });
+  apiRateLimiter = new ApiRateLimiter({
+    redis: redis.native,
+    windowMs: API_RATE_LIMIT_WINDOW_MS,
+    logger,
+  });
   const dbData = createDatabase({ url: config.DATABASE_URL, applicationName: "api", logger });
   sql = dbData.sql;
   db = dbData.db;
@@ -366,18 +373,27 @@ export async function startApiServer() {
   server.keepAliveTimeout = 5_000;
 
   async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise<void> {
-    const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "localhost"}`);
+    // Fast pathname extraction: avoid allocating a full WHATWG URL object on every
+    // request. `new URL()` parses scheme, host, port, path, and query — most of
+    // which we never use on the hot path. URLSearchParams is built lazily and only
+    // materialises when a handler or the auth block actually needs it.
+    const rawUrl = req.url ?? "/";
+    const qIdx = rawUrl.indexOf("?");
+    const pathname = qIdx === -1 ? rawUrl : rawUrl.slice(0, qIdx);
+    let _lazyUrl: URL | null = null;
+    const getUrl = (): URL => (_lazyUrl ??= new URL(rawUrl, "http://n"));
+    const searchParams = (): URLSearchParams => getUrl().searchParams;
     const origin = req.headers["origin"] as string | undefined;
     const allowedOrigins = (config.CORS_ORIGIN ?? "")
       .split(",")
       .map((s) => s.trim())
       .filter(Boolean);
     const isSessionRoute =
-      url.pathname.startsWith("/v1/auth/") ||
-      url.pathname === "/v1/projects" ||
-      url.pathname.startsWith("/v1/projects/") ||
-      url.pathname.startsWith("/v1/system/") ||
-      url.pathname.startsWith("/v1/dlq");
+      pathname.startsWith("/v1/auth/") ||
+      pathname === "/v1/projects" ||
+      pathname.startsWith("/v1/projects/") ||
+      pathname.startsWith("/v1/system/") ||
+      pathname.startsWith("/v1/dlq");
 
     if (isSessionRoute) {
       if (origin && allowedOrigins.includes(origin)) {
@@ -400,8 +416,8 @@ export async function startApiServer() {
       return;
     }
 
-    if (url.pathname === "/admin" || url.pathname.startsWith("/admin/")) {
-      const handled = await handleAdminRequest(req, res, url);
+    if (pathname === "/admin" || pathname.startsWith("/admin/")) {
+      const handled = await handleAdminRequest(req, res, getUrl());
       if (handled) return;
     }
 
@@ -411,23 +427,23 @@ export async function startApiServer() {
     let isAdminToken = false;
 
     const isProjectManagement =
-      url.pathname === "/v1/projects" || url.pathname.startsWith("/v1/projects/");
+      pathname === "/v1/projects" || pathname.startsWith("/v1/projects/");
 
     // Unsubscribe is reached from a mail client, which has no API key and never
     // will. The signed token in the URL is the credential, and it authorises
     // exactly one action for one address.
-    const isPublicUnsubscribe = url.pathname === "/v1/unsubscribe";
-    const isPublicAuth = url.pathname === "/v1/auth/login";
+    const isPublicUnsubscribe = pathname === "/v1/unsubscribe";
+    const isPublicAuth = pathname === "/v1/auth/login";
 
     if (
-      url.pathname.startsWith("/v1/") &&
+      pathname.startsWith("/v1/") &&
       !isProjectManagement &&
       !isPublicUnsubscribe &&
       !isPublicAuth
     ) {
       let token = extractAuthToken(req);
-      if (!token && url.searchParams.has("token")) {
-        token = url.searchParams.get("token") || undefined;
+      if (!token && searchParams().has("token")) {
+        token = searchParams().get("token") || undefined;
       }
 
       if (!token) {
@@ -455,12 +471,12 @@ export async function startApiServer() {
       if (isAdminToken) {
         const headerProjectId =
           (req.headers["x-project-id"] as string | undefined) ||
-          url.searchParams.get("projectId") ||
+          searchParams().get("projectId") ||
           undefined;
         const isProjectAgnostic =
-          url.pathname.startsWith("/v1/auth/") ||
-          url.pathname.startsWith("/v1/system/") ||
-          url.pathname.startsWith("/v1/dlq");
+          pathname.startsWith("/v1/auth/") ||
+          pathname.startsWith("/v1/system/") ||
+          pathname.startsWith("/v1/dlq");
         if (!headerProjectId && !isProjectAgnostic) {
           sendJson(res, 400, {
             error: "bad_request",
@@ -512,40 +528,20 @@ export async function startApiServer() {
         }
       }
 
-      // Project rate limit - Sliding Window Counter
-      const nowMs = Date.now();
-      const currentBucket = Math.floor(nowMs / API_RATE_LIMIT_WINDOW_MS);
-      const prevBucket = currentBucket - 1;
-      const rlTag = `{rate-limit:api:req:${projectId || "global"}}`;
-      const currentKey = `${rlTag}:${currentBucket}`;
-      const prevKey = `${rlTag}:${prevBucket}`;
-
-      let count = 0;
-      try {
-        if (typeof redis.native.checkApiRateLimit === "function") {
-          count = await redis.native.checkApiRateLimit(
-            currentKey,
-            prevKey,
-            nowMs,
-            API_RATE_LIMIT_WINDOW_MS,
-            projectRateLimitRpm,
-          );
-        } else {
-          count = (await redis.native.eval(
-            LUA_SLIDING_WINDOW_COUNTER,
-            2,
-            currentKey,
-            prevKey,
-            nowMs,
-            API_RATE_LIMIT_WINDOW_MS,
-            projectRateLimitRpm,
-          )) as number;
-        }
-      } catch (err) {
-        logger.warn({ err, projectId }, "project rate limit check failed — allowing request");
+      // Project rate limit - In-Memory Token Leasing with Redis Sliding Window
+      if (!apiRateLimiter && redis?.native) {
+        apiRateLimiter = new ApiRateLimiter({
+          redis: redis.native,
+          windowMs: API_RATE_LIMIT_WINDOW_MS,
+          logger,
+        });
       }
 
-      if (count === -1) {
+      const allowed = apiRateLimiter
+        ? await apiRateLimiter.check(projectId || "global", projectRateLimitRpm)
+        : true;
+
+      if (!allowed) {
         if (!res.headersSent) {
           res.setHeader("Retry-After", "60");
           sendJson(res, 429, {
@@ -628,7 +624,7 @@ export async function startApiServer() {
       }
     }
 
-    const route = router.match(req.method ?? "GET", url.pathname);
+    const route = router.match(req.method ?? "GET", pathname);
 
     if (!route) {
       sendJson(res, 404, { error: "not_found" });
@@ -637,7 +633,7 @@ export async function startApiServer() {
 
     const ctx = {
       params: route.params,
-      query: url.searchParams,
+      query: searchParams(),
       projectId,
       role: keyRole,
       isAdmin: isAdminToken,
@@ -658,8 +654,12 @@ export async function startApiServer() {
   await authSubscriber.subscribe(API_KEY_INVALIDATION_CHANNEL);
   authSubscriber.on("message", (channel: string, tokenHash: string) => {
     if (channel !== API_KEY_INVALIDATION_CHANNEL) return;
-    if (tokenHash === "*") authCache.clear();
-    else authCache.delete(tokenHash);
+    if (tokenHash === "*") {
+      authCache.clear();
+      apiRateLimiter?.clear();
+    } else {
+      authCache.delete(tokenHash);
+    }
     logger.info({ tokenHash }, "api key cache invalidated");
   });
 
