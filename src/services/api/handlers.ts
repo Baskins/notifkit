@@ -344,7 +344,9 @@ export function createHandlers(deps: Deps) {
     res: ServerResponse,
     ctx: RouteContext,
   ): Promise<void> {
-    const parsed = NotifyRequestSchema.safeParse(await readJsonBody(req));
+    const rawBody = await readJsonBody(req);
+    const parsed = NotifyRequestSchema.safeParse(rawBody);
+
     if (!parsed.success) return sendValidationError(res, parsed.error);
     const body = parsed.data;
 

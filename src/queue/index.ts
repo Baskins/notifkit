@@ -67,11 +67,20 @@ export interface StreamProducerOptions {
   maxLen?: number;
 }
 
+interface PendingPublishItem {
+  event: StreamEvent;
+  resolve: (messageId: string) => void;
+  reject: (err: unknown) => void;
+}
+
 export class StreamProducer {
   private readonly redis: Redis;
   private readonly stream: StreamName;
   private readonly logger?: Logger;
   private readonly maxLen: number;
+  private pendingQueue: PendingPublishItem[] = [];
+  private flushScheduled = false;
+  private lastMaxLenCheck = 0;
 
   constructor({ redis, stream, logger, maxLen }: StreamProducerOptions) {
     this.redis = redis;
@@ -87,45 +96,105 @@ export class StreamProducer {
       timestamp: new Date().toISOString(),
     };
 
-    const messageId = await this.redis.xadd(
-      this.stream,
-      "MAXLEN",
-      "~",
-      String(this.maxLen),
-      "*",
-      "data",
-      JSON.stringify(event),
-    );
+    return new Promise<string>((resolve, reject) => {
+      this.pendingQueue.push({ event, resolve, reject });
+      if (this.pendingQueue.length >= 100) {
+        void this.flush();
+      } else if (!this.flushScheduled) {
+        this.flushScheduled = true;
+        setImmediate(() => {
+          void this.flush();
+        });
+      }
+    });
+  }
 
-    if (!messageId) throw new Error(`XADD to ${this.stream} returned null`);
+  private async flush(): Promise<void> {
+    this.flushScheduled = false;
+    const batch = this.pendingQueue;
+    this.pendingQueue = [];
+    if (batch.length === 0) return;
 
-    this.logger?.debug(
-      { stream: this.stream, messageId, eventType: event.type, eventId: event.id },
-      "event published",
-    );
+    try {
+      if (typeof this.redis.pipeline === "function") {
+        const pipeline = this.redis.pipeline();
+        for (let i = 0; i < batch.length; i++) {
+          const item = batch[i]!;
+          if (i === batch.length - 1) {
+            pipeline.xadd(
+              this.stream,
+              "MAXLEN",
+              "~",
+              String(this.maxLen),
+              "*",
+              "data",
+              JSON.stringify(item.event),
+            );
+          } else {
+            pipeline.xadd(this.stream, "*", "data", JSON.stringify(item.event));
+          }
+        }
 
-    return messageId;
+        const results = await pipeline.exec();
+        if (!results) throw new Error(`Pipeline execution failed for ${this.stream}`);
+
+        for (let i = 0; i < results.length; i++) {
+          const [err, msgId] = results[i] ?? [];
+          if (err) {
+            batch[i]!.reject(err);
+          } else {
+            batch[i]!.resolve(msgId as string);
+          }
+        }
+      } else {
+        for (let i = 0; i < batch.length; i++) {
+          const item = batch[i]!;
+          try {
+            const msgId = await this.redis.xadd(
+              this.stream,
+              "MAXLEN",
+              "~",
+              String(this.maxLen),
+              "*",
+              "data",
+              JSON.stringify(item.event),
+            );
+            if (!msgId) throw new Error(`XADD to ${this.stream} returned null`);
+            item.resolve(msgId);
+          } catch (err) {
+            item.reject(err);
+          }
+        }
+      }
+
+      this.monitorMaxLen(this.stream).catch(() => {});
+    } catch (err) {
+      for (const item of batch) {
+        item.reject(err);
+      }
+    }
   }
 
   private async monitorMaxLen(stream: string) {
-    if (Math.random() < 0.05) {
-      // Check ~5% of the time to avoid overhead
-      try {
-        const len = await this.redis.xlen(stream);
-        metrics.queueSize.set({ stream }, len);
+    const now = Date.now();
+    if (now - this.lastMaxLenCheck < 5000) return;
+    this.lastMaxLenCheck = now;
 
-        if (len > this.maxLen * 0.8) {
-          this.logger?.warn(
-            { stream, len, maxLen: this.maxLen },
-            "stream is nearing MAXLEN limit (80%+)",
-          );
-        }
+    try {
+      const len = await this.redis.xlen(stream);
+      metrics.queueSize.set({ stream }, len);
 
-        const dlqLen = await this.redis.xlen(STREAMS.DEAD_LETTER);
-        metrics.queueSize.set({ stream: STREAMS.DEAD_LETTER }, dlqLen);
-      } catch (err) {
-        this.logger?.debug({ err }, "failed to monitor stream length");
+      if (len > this.maxLen * 0.8) {
+        this.logger?.warn(
+          { stream, len, maxLen: this.maxLen },
+          "stream is nearing MAXLEN limit (80%+)",
+        );
       }
+
+      const dlqLen = await this.redis.xlen(STREAMS.DEAD_LETTER);
+      metrics.queueSize.set({ stream: STREAMS.DEAD_LETTER }, dlqLen);
+    } catch (err) {
+      this.logger?.debug({ err }, "failed to monitor stream length");
     }
   }
 
@@ -134,47 +203,16 @@ export class StreamProducer {
   ): Promise<{ messageIds: string[]; eventIds: string[] }> {
     if (partials.length === 0) return { messageIds: [], eventIds: [] };
 
-    const pipeline = this.redis.pipeline();
-    const timestamp = new Date().toISOString();
-
     const eventIds: string[] = [];
+    const promises: Promise<string>[] = [];
 
     for (const partial of partials) {
       const id = crypto.randomUUID();
       eventIds.push(id);
-      const event: StreamEvent = {
-        ...partial,
-        id,
-        timestamp,
-      };
-
-      pipeline.xadd(
-        this.stream,
-        "MAXLEN",
-        "~",
-        String(this.maxLen),
-        "*",
-        "data",
-        JSON.stringify(event),
-      );
+      promises.push(this.publish(partial));
     }
 
-    const results = await pipeline.exec();
-    if (!results) throw new Error(`Pipeline execution failed for ${this.stream}`);
-
-    const messageIds: string[] = [];
-    for (let i = 0; i < results.length; i++) {
-      const result = results[i];
-      if (!result) throw new Error("Pipeline result is undefined");
-      const [err, msgId] = result;
-      if (err) throw err;
-      messageIds.push(msgId as string);
-    }
-
-    this.logger?.debug({ stream: this.stream, count: partials.length }, "batch events published");
-
-    this.monitorMaxLen(this.stream).catch(() => {});
-
+    const messageIds = await Promise.all(promises);
     return { messageIds, eventIds };
   }
 }
