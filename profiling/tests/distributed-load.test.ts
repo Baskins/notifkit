@@ -30,6 +30,7 @@ export interface DistributedLoadTestOptions {
   providerLatencyMs?: number | string;
   serverServices?: string[];
   serverNodes?: Array<{ name: string; port: number; services?: string }>;
+  warmupSeconds?: number;
   quiet?: boolean;
 }
 
@@ -109,10 +110,11 @@ export async function runDistributedBenchmark(
 
   const effectiveServerCount = nodes.length;
 
-  const services = ["db", "redis", ...nodes.map((n) => n.name)];
+  const inDockerLoadGen = process.env.IN_DOCKER_LOAD !== "0";
+  const services = ["db", "redis", ...nodes.map((n) => n.name), ...(inDockerLoadGen ? ["load-generator"] : [])];
 
   console.log(
-    `🚀 Booting distributed profiling environment (${effectiveServerCount} Server Instances: [${nodes.map((n) => n.name).join(", ")}] | ${serverCpus} vCPU each, ${serverMemory} RAM | DB: ${composeEnv.DB_CPUS ?? "2.0"} vCPU | Redis: ${composeEnv.REDIS_CPUS ?? "1.5"} vCPU | Provider Latency: ${providerLatency}ms)...`,
+    `🚀 Booting distributed profiling environment (${effectiveServerCount} Server Instances: [${nodes.map((n) => n.name).join(", ")}] | ${serverCpus} vCPU each, ${serverMemory} RAM | DB: ${composeEnv.DB_CPUS ?? "2.0"} vCPU | Redis: ${composeEnv.REDIS_CPUS ?? "1.5"} vCPU | In-Docker Load: ${inDockerLoadGen} | Provider Latency: ${providerLatency}ms)...`,
   );
 
   const environment = await new DockerComposeEnvironment(".", "docker-compose.distributed.yml")
@@ -254,6 +256,36 @@ export async function runDistributedBenchmark(
     `\n🔥 Starting Distributed Load Generation: ${activeServices.length} microservices blasting concurrently (${concurrency} parallel workers, ~${workersPerService} workers/service) across ${targetApiUrls.length} API ingress node(s) for ${durationSec}s`,
   );
 
+  const redisContainer = environment.getContainer("redis-1");
+  const apiContainer = environment.getContainer(`${nodes[0]!.name}-1`);
+
+  // Helper to read /sys/fs/cgroup/cpu.stat
+  async function getContainerCpuStat(container: any) {
+    try {
+      const res = await container.exec(["cat", "/sys/fs/cgroup/cpu.stat"]);
+      const out = res.output || "";
+      const nrThrottledMatch = out.match(/nr_throttled\s+(\d+)/);
+      const throttledUsecMatch = out.match(/throttled_usec\s+(\d+)/);
+      const usageUsecMatch = out.match(/usage_usec\s+(\d+)/);
+      return {
+        nrThrottled: nrThrottledMatch ? Number(nrThrottledMatch[1]) : 0,
+        throttledUsec: throttledUsecMatch ? Number(throttledUsecMatch[1]) : 0,
+        usageUsec: usageUsecMatch ? Number(usageUsecMatch[1]) : 0,
+      };
+    } catch {
+      return { nrThrottled: 0, throttledUsec: 0, usageUsec: 0 };
+    }
+  }
+
+  // Reset Redis stats and capture start CPU baseline
+  await redisContainer.exec(["redis-cli", "CONFIG", "RESETSTAT"]);
+  const redisCpuStartRaw = (await redisContainer.exec(["redis-cli", "INFO", "cpu"])).output || "";
+  const redisUserCpuStart = Number(redisCpuStartRaw.match(/used_cpu_user:([\d.]+)/)?.[1] || 0);
+  const redisSysCpuStart = Number(redisCpuStartRaw.match(/used_cpu_sys:([\d.]+)/)?.[1] || 0);
+
+  const apiCpuStatStart = await getContainerCpuStat(apiContainer);
+  const redisCpuStatStart = await getContainerCpuStat(redisContainer);
+
   let requestsSent = 0;
   let successCount = 0;
   let failCount = 0;
@@ -271,49 +303,153 @@ export async function runDistributedBenchmark(
     );
   }, 10000);
 
-  async function worker(workerIndex: number) {
-    const targetUrl = targetApiUrls[workerIndex % targetApiUrls.length]!;
-    const svc = activeServices[workerIndex % activeServices.length]!;
-    while (Date.now() < endTime) {
-      requestsSent++;
-      try {
-        const reqStart = Date.now();
-        const res = await fetch(`${targetUrl}/v1/notify`, {
-          method: "POST",
-          headers: {
-            Authorization: `Bearer ${projectApiKey}`,
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify({
-            user: "perf-user-1",
-            template: "perf-email",
-            channels: ["email"],
-            priority: svc.priority,
-            data: {
-              name: "Load Tester",
-              service: svc.name,
-              event: svc.event,
-              requestTime: reqStart,
+  let apiP50 = 0;
+  let apiP95 = 0;
+  let apiP99 = 0;
+
+  const warmupSec = options.warmupSeconds ?? (durationSec >= 180 ? 45 : 0);
+
+  if (inDockerLoadGen) {
+    console.log(`\n⚡ Executing k6 Load Generator on container bridge network (${concurrency} VUs, ${warmupSec}s warmup + ${durationSec}s steady-state)...`);
+    const loadGenContainer = environment.getContainer("load-generator-1");
+
+    const execRes = await loadGenContainer.exec([
+      "k6",
+      "run",
+      "--summary-trend-stats=avg,min,med,max,p(50),p(90),p(95),p(99)",
+      "/scripts/k6-script.js",
+    ], {
+      env: {
+        API_URL: "http://api-server-1:3000",
+        PROJECT_API_KEY: projectApiKey,
+        WARMUP_DURATION: `${warmupSec}s`,
+        DURATION: `${durationSec}s`,
+        VUS: String(concurrency),
+      },
+    });
+
+    const output = execRes.output || "";
+    console.log(output);
+
+    function parseK6Duration(valStr?: string): number {
+      if (!valStr) return 0;
+      if (valStr.endsWith("ms")) return Math.round(parseFloat(valStr));
+      if (valStr.endsWith("s")) return Math.round(parseFloat(valStr) * 1000);
+      return Math.round(parseFloat(valStr));
+    }
+
+    // Extract steady-state custom metrics if present, otherwise fall back to scenario or general metrics
+    const steadyDurMatch = output.match(/steady_http_req_duration[\s.]+:[^\n]*?p\(50\)=([\d.]+(?:ms|s))[^\n]*?p\(95\)=([\d.]+(?:ms|s))[^\n]*?p\(99\)=([\d.]+(?:ms|s))/);
+    const scenarioDurMatch = output.match(/http_req_duration\{scenario:steady_state\}[\s.]+:[^\n]*?p\(50\)=([\d.]+(?:ms|s))[^\n]*?p\(95\)=([\d.]+(?:ms|s))[^\n]*?p\(99\)=([\d.]+(?:ms|s))/);
+    const durMatch = steadyDurMatch || scenarioDurMatch || output.match(/http_req_duration[\s.]+:[^\n]*?p\(50\)=([\d.]+(?:ms|s))[^\n]*?p\(95\)=([\d.]+(?:ms|s))[^\n]*?p\(99\)=([\d.]+(?:ms|s))/);
+
+    if (durMatch) {
+      apiP50 = parseK6Duration(durMatch[1]);
+      apiP95 = parseK6Duration(durMatch[2]);
+      apiP99 = parseK6Duration(durMatch[3]);
+    }
+
+    const steadyReqsMatch = output.match(/steady_http_reqs[\s.]+:\s*(\d+)\s+([\d.]+)\/s/);
+    const scenarioReqsMatch = output.match(/http_reqs\{scenario:steady_state\}[\s.]+:\s*(\d+)\s+([\d.]+)\/s/);
+    const reqsMatch = steadyReqsMatch || scenarioReqsMatch || output.match(/http_reqs[\s.]+:\s*(\d+)\s+([\d.]+)\/s/);
+    if (reqsMatch) {
+      requestsSent = Number(reqsMatch[1]);
+      successCount = requestsSent;
+    }
+  } else {
+    async function worker(workerIndex: number) {
+      const targetUrl = targetApiUrls[workerIndex % targetApiUrls.length]!;
+      const svc = activeServices[workerIndex % activeServices.length]!;
+      while (Date.now() < endTime) {
+        requestsSent++;
+        try {
+          const reqStart = Date.now();
+          const res = await fetch(`${targetUrl}/v1/notify`, {
+            method: "POST",
+            headers: {
+              Authorization: `Bearer ${projectApiKey}`,
+              "Content-Type": "application/json",
             },
-          }),
-        });
+            body: JSON.stringify({
+              user: "perf-user-1",
+              template: "perf-email",
+              channels: ["email"],
+              priority: svc.priority,
+              data: {
+                name: "Load Tester",
+                service: svc.name,
+                event: svc.event,
+                requestTime: reqStart,
+              },
+            }),
+          });
 
-        apiLatencies.push(Date.now() - reqStart);
+          apiLatencies.push(Date.now() - reqStart);
 
-        if (res.status === 202) {
-          successCount++;
-        } else {
+          if (res.status === 202) {
+            successCount++;
+          } else {
+            failCount++;
+          }
+        } catch {
           failCount++;
         }
-      } catch {
-        failCount++;
       }
     }
+
+    const workers = Array.from({ length: concurrency }).map((_, i) => worker(i));
+    await Promise.all(workers);
+    apiP50 = percentile(apiLatencies, 50);
+    apiP95 = percentile(apiLatencies, 95);
+    apiP99 = percentile(apiLatencies, 99);
   }
 
-  const workers = Array.from({ length: concurrency }).map((_, i) => worker(i));
-  await Promise.all(workers);
   clearInterval(progressInterval);
+
+  // Capture Redis commandstats & CPU at the end of load generation
+  const redisCmdStatsRaw = (await redisContainer.exec(["redis-cli", "INFO", "commandstats"])).output || "";
+  const redisCpuEndRaw = (await redisContainer.exec(["redis-cli", "INFO", "cpu"])).output || "";
+  const redisUserCpuEnd = Number(redisCpuEndRaw.match(/used_cpu_user:([\d.]+)/)?.[1] || 0);
+  const redisSysCpuEnd = Number(redisCpuEndRaw.match(/used_cpu_sys:([\d.]+)/)?.[1] || 0);
+
+  const apiCpuStatEnd = await getContainerCpuStat(apiContainer);
+  const redisCpuStatEnd = await getContainerCpuStat(redisContainer);
+
+  const redisCpuTotalDeltaSec = (redisUserCpuEnd - redisUserCpuStart) + (redisSysCpuEnd - redisSysCpuStart);
+  const redisCpuUtilizationPct = ((redisCpuTotalDeltaSec / durationSec) * 100).toFixed(1);
+
+  const apiNrThrottled = apiCpuStatEnd.nrThrottled - apiCpuStatStart.nrThrottled;
+  const apiThrottledMs = ((apiCpuStatEnd.throttledUsec - apiCpuStatStart.throttledUsec) / 1000).toFixed(1);
+  const redisNrThrottled = redisCpuStatEnd.nrThrottled - redisCpuStatStart.nrThrottled;
+  const redisThrottledMs = ((redisCpuStatEnd.throttledUsec - redisCpuStatStart.throttledUsec) / 1000).toFixed(1);
+
+  console.log("\n" + "=".repeat(95));
+  console.log(" 🔍 SYSTEM & REDIS TELEMETRY EMPIRICAL METRICS");
+  console.log("=".repeat(95));
+  console.log(`Redis Actual CPU Utilization:  ${redisCpuUtilizationPct}% (User: ${(redisUserCpuEnd - redisUserCpuStart).toFixed(2)}s, Sys: ${(redisSysCpuEnd - redisSysCpuStart).toFixed(2)}s over ${durationSec}s window)`);
+  console.log(`API Container Throttling:      nr_throttled: ${apiNrThrottled} | throttled_time: ${apiThrottledMs}ms`);
+  console.log(`Redis Container Throttling:    nr_throttled: ${redisNrThrottled} | throttled_time: ${redisThrottledMs}ms`);
+  console.log("\n📊 Redis Commandstats (Top Commands):");
+  const cmdLines = redisCmdStatsRaw
+    .split("\n")
+    .filter((l: string) => l.startsWith("cmdstat_"))
+    .map((l: string) => {
+      const match = l.match(/^cmdstat_([^:]+):calls=(\d+),usec=(\d+),usec_per_call=([\d.]+)/);
+      if (!match) return null;
+      return {
+        cmd: match[1],
+        calls: Number(match[2]),
+        usec: Number(match[3]),
+        usecPerCall: Number(match[4]),
+      };
+    })
+    .filter(Boolean)
+    .sort((a: any, b: any) => b.usec - a.usec);
+
+  for (const c of cmdLines.slice(0, 10)) {
+    console.log(`  • ${(c.cmd + ":").padEnd(16)} calls=${String(c.calls).padStart(8)} | usec_per_call=${c.usecPerCall.toFixed(2).padStart(8)} µs | total_ms=${(c.usec / 1000).toFixed(1).padStart(8)} ms`);
+  }
+  console.log("=".repeat(95) + "\n");
 
   const activeWindowSec = durationSec;
   const ingestionThroughput = (requestsSent / activeWindowSec).toFixed(2);
@@ -385,9 +521,6 @@ export async function runDistributedBenchmark(
     `Total Wall Drain Rate:${totalDeliveryRate} msgs/sec (${totalElapsed.toFixed(2)}s total)`,
   );
   console.log("---------------------------------");
-  const apiP50 = percentile(apiLatencies, 50);
-  const apiP95 = percentile(apiLatencies, 95);
-  const apiP99 = percentile(apiLatencies, 99);
   const deliveryP50 = percentile(deliveryLatencies, 50);
   const deliveryP95 = percentile(deliveryLatencies, 95);
   const deliveryP99 = percentile(deliveryLatencies, 99);
@@ -430,3 +563,4 @@ export async function runDistributedBenchmark(
     totalDelivered: deliveryLatencies.length,
   };
 }
+

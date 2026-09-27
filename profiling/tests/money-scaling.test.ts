@@ -202,6 +202,7 @@ export function calculateStats(values: number[]): MetricStats {
 function parseArgs() {
   const args = process.argv.slice(2);
   let durationSeconds = 600; // 10 minutes default
+  let warmupSeconds: number | undefined;
   let runs = 3; // 3 runs default
   let providerLatencyMs: number | string | undefined = process.env.PROVIDER_LATENCY_MS || "150-250";
   let tiers = DEFAULT_BUDGET_TIERS;
@@ -209,10 +210,13 @@ function parseArgs() {
   for (const arg of args) {
     if (arg.startsWith("--duration=")) {
       durationSeconds = parseInt(arg.split("=")[1]!, 10);
+    } else if (arg.startsWith("--warmup=")) {
+      warmupSeconds = parseInt(arg.split("=")[1]!, 10);
     } else if (arg.startsWith("--runs=") || arg.startsWith("--iterations=")) {
       runs = parseInt(arg.split("=")[1]!, 10);
     } else if (arg === "--quick") {
       durationSeconds = 5;
+      warmupSeconds = 0;
       runs = 1;
     } else if (arg.startsWith("--latency=")) {
       const val = arg.split("=")[1]!;
@@ -233,7 +237,7 @@ function parseArgs() {
     }
   }
 
-  return { durationSeconds, runs, providerLatencyMs, tiers };
+  return { durationSeconds, warmupSeconds, runs, providerLatencyMs, tiers };
 }
 
 function printTierBreakdown(stat: TierAggregatedStats, runsCount: number) {
@@ -399,7 +403,7 @@ function printSummaryTable(allStats: TierAggregatedStats[], runsCount: number) {
 }
 
 async function main() {
-  const { durationSeconds, runs, providerLatencyMs, tiers } = parseArgs();
+  const { durationSeconds, warmupSeconds, runs, providerLatencyMs, tiers } = parseArgs();
 
   console.log(
     "==========================================================================================",
@@ -458,6 +462,7 @@ async function main() {
         serverServices: tier.serverServices,
         serverNodes: tier.serverNodes,
         providerLatencyMs,
+        warmupSeconds,
         durationSeconds,
         concurrency: tier.concurrency,
         servicesCount: tier.servicesCount,

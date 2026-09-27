@@ -15,6 +15,7 @@ services:
 
   redis:
     image: redis:7-alpine
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
     ports:
       - "36379:6379"
     deploy:
@@ -40,10 +41,8 @@ services:
       PROVIDER_LATENCY_MS: ${PROVIDER_LATENCY_MS:-0}
       RATE_LIMIT_PER_HOUR: ${RATE_LIMIT_PER_HOUR:-10000000}
       SERVICES: ${API_SERVER_1_SERVICES:-api}
-      NODE_OPTIONS: "--inspect=0.0.0.0:9229"
     ports:
       - "35678:3000"
-      - "9229:9229"
     depends_on:
       - db
       - redis
@@ -444,3 +443,20 @@ services:
         limits:
           cpus: "${SERVER_CPUS:-2.0}"
           memory: "${SERVER_MEMORY:-2G}"
+
+  load-generator:
+    image: grafana/k6:latest
+    entrypoint: ["sh", "-c"]
+    command: ["sleep infinity"]
+    volumes:
+      - ./k6-script.js:/scripts/k6-script.js:ro
+    depends_on:
+      - db
+      - redis
+    deploy:
+      resources:
+        limits:
+          cpus: "${LOAD_GEN_CPUS:-4.0}"
+          memory: "${LOAD_GEN_MEMORY:-2G}"
+
+

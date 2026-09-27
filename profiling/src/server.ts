@@ -71,7 +71,9 @@ const services: (
     : ["api", "enricher", "engine", "delivery", "scheduler"];
 
 const isApiOnly = services.length === 1 && services[0] === "api";
-const clusterWorkers = isApiOnly ? 2 : 1;
+const clusterWorkers = process.env.CLUSTER_WORKERS
+  ? parseInt(process.env.CLUSTER_WORKERS, 10)
+  : 1;
 
 if (clusterWorkers > 1 && cluster.isPrimary) {
   console.log(`⚡ Forking ${clusterWorkers} API worker processes on port ${PORT}...`);
