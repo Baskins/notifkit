@@ -434,8 +434,7 @@ export async function startApiServer() {
     let keyRole: "admin" | "read_only" = "admin";
     let isAdminToken = false;
 
-    const isProjectManagement =
-      pathname === "/v1/projects" || pathname.startsWith("/v1/projects/");
+    const isProjectManagement = pathname === "/v1/projects" || pathname.startsWith("/v1/projects/");
 
     // Unsubscribe is reached from a mail client, which has no API key and never
     // will. The signed token in the URL is the credential, and it authorises
@@ -519,11 +518,12 @@ export async function startApiServer() {
             sendJson(res, 401, { error: "unauthorized", message: "Invalid or missing API key" });
             return;
           }
-          projectId = rows[0]!.id;
+          const matchedProjectId = rows[0]!.id;
+          projectId = matchedProjectId;
           projectRateLimitRpm = rows[0]!.rateLimitRpm ?? 600;
           keyRole = rows[0]!.role;
           authCache.set(token, {
-            projectId,
+            projectId: matchedProjectId,
             projectRateLimitRpm,
             keyRole,
             tokenHash,
@@ -660,7 +660,7 @@ export async function startApiServer() {
         if (!res.headersSent) sendJson(res, err.status, { error: err.code, message: err.message });
         return;
       }
-      logger.error({ err, path: url.pathname }, "unhandled request error");
+      logger.error({ err, path: pathname }, "unhandled request error");
       if (!res.headersSent) sendJson(res, 500, { error: "internal_error" });
     });
   }
