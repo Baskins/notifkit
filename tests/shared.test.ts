@@ -40,9 +40,12 @@ describe("getPriorityBucket (Priority Classification)", () => {
     expect(getPriorityBucket("")).toBe("normal");
   });
 
-  it("maps 'critical' and 'high' to 'critical'", () => {
+  it("maps 'critical' to 'critical'", () => {
     expect(getPriorityBucket("critical")).toBe("critical");
-    expect(getPriorityBucket("high")).toBe("critical");
+  });
+
+  it("maps 'high' to 'normal'", () => {
+    expect(getPriorityBucket("high")).toBe("normal");
   });
 
   it("maps 'low' to 'low'", () => {

@@ -387,11 +387,10 @@ export class EnricherWorker extends BaseWorker {
         );
 
         const batchedEvents: Record<
-          "critical" | "high" | "normal" | "low",
+          "critical" | "normal" | "low",
           Omit<any, "id" | "timestamp">[]
         > = {
           critical: [],
-          high: [],
           normal: [],
           low: [],
         };

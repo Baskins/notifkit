@@ -4,11 +4,13 @@ import {
   type NotificationDispatchedPayload,
   type DeliveryResult,
 } from "notifkit";
+import http from "node:http";
 
 const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 3000;
 const workerConcurrency = process.env.WORKER_CONCURRENCY
   ? parseInt(process.env.WORKER_CONCURRENCY, 10)
   : 50;
+
 function parseLatency(val?: string): { min: number; max: number } {
   if (!val) return { min: 0, max: 0 };
   if (val.includes("-")) {
@@ -57,68 +59,51 @@ class ProfilingTransport implements Transport {
   }
 }
 
-import http from "node:http";
-import cluster from "node:cluster";
-
 const rawServices = process.env.SERVICES?.trim();
-const services: (
-  "api" | "enricher" | "engine" | "delivery" | "scheduler" | "ai" | "workflow" | "events"
-)[] =
+const validServices = ["api", "enricher", "engine", "delivery", "scheduler"] as const;
+type ServiceType = (typeof validServices)[number];
+
+const services: ServiceType[] =
   rawServices && rawServices !== "all"
-    ? (rawServices.split(",").map((s) => s.trim()) as (
-        "api" | "enricher" | "engine" | "delivery" | "scheduler"
-      )[])
+    ? rawServices
+        .split(",")
+        .map((s) => s.trim())
+        .filter((s): s is ServiceType => (validServices as readonly string[]).includes(s))
     : ["api", "enricher", "engine", "delivery", "scheduler"];
 
-const isApiOnly = services.length === 1 && services[0] === "api";
-const clusterWorkers = process.env.CLUSTER_WORKERS
-  ? parseInt(process.env.CLUSTER_WORKERS, 10)
-  : 1;
+const server = new NotifkitServer({
+  services,
+  redisUrl: process.env.REDIS_URL || "redis://localhost:6379",
+  databaseUrl: process.env.DATABASE_URL || "postgres://notifkit:password@localhost:5432/notifkit",
+  logLevel: (process.env.LOG_LEVEL as any) || "info",
+  autoMigrate: false,
+  port: PORT,
+  workerConcurrency,
+  providers: [new ProfilingTransport()],
+});
 
-if (clusterWorkers > 1 && cluster.isPrimary) {
-  console.log(`⚡ Forking ${clusterWorkers} API worker processes on port ${PORT}...`);
-  for (let i = 0; i < clusterWorkers; i++) {
-    cluster.fork();
-  }
-  cluster.on("exit", (w) => {
-    console.warn(`Worker ${w.process.pid} exited, spawning replacement...`);
-    cluster.fork();
+server
+  .start()
+  .then(() => {
+    console.log(
+      `🚀 Profiling Server started on port ${PORT} [services: ${services.join(",")}] (pid: ${process.pid})`,
+    );
+
+    // If API is not enabled on this worker node, expose a lightweight health responder
+    if (!services.includes("api")) {
+      const healthServer = http.createServer((req, res) => {
+        if (req.url === "/health") {
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ status: "ok", services, isWorkerOnly: true }));
+        } else {
+          res.writeHead(404);
+          res.end();
+        }
+      });
+      healthServer.listen(PORT, "0.0.0.0");
+    }
+  })
+  .catch((err) => {
+    console.error("Failed to start profiling server:", err);
+    process.exit(1);
   });
-} else {
-  const server = new NotifkitServer({
-    services,
-    redisUrl: process.env.REDIS_URL || "redis://localhost:6379",
-    databaseUrl: process.env.DATABASE_URL || "postgres://notifkit:password@localhost:5432/notifkit",
-    logLevel: (process.env.LOG_LEVEL as "info" | "warn" | "error" | "debug") || "info",
-    autoMigrate: false,
-    port: PORT,
-    workerConcurrency,
-    providers: [new ProfilingTransport()],
-  });
-
-  server
-    .start()
-    .then(() => {
-      console.log(
-        `🚀 Profiling Server started on port ${PORT} [services: ${services.join(",")}] (pid: ${process.pid})`,
-      );
-
-      // If API is not enabled on this worker node, expose a lightweight health responder so orchestration succeeds
-      if (!services.includes("api")) {
-        const healthServer = http.createServer((req, res) => {
-          if (req.url === "/health") {
-            res.writeHead(200, { "Content-Type": "application/json" });
-            res.end(JSON.stringify({ status: "ok", services, isWorkerOnly: true }));
-          } else {
-            res.writeHead(404);
-            res.end();
-          }
-        });
-        healthServer.listen(PORT, "0.0.0.0");
-      }
-    })
-    .catch((err) => {
-      console.error("Failed to start profiling server:", err);
-      process.exit(1);
-    });
-}

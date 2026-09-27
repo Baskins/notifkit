@@ -5,12 +5,11 @@
   "type": "module",
   "scripts": {
     "start": "tsx src/server.ts",
-    "test:load": "tsx tests/load.test.ts",
-    "test:scaling": "tsx tests/scaling.test.ts",
-    "test:distributed": "tsx tests/distributed-scaling.test.ts",
-    "test:money": "tsx tests/money-scaling.test.ts",
-    "test:cpu": "tsx tests/scaling.test.ts",
-    "test": "tsx tests/load.test.ts"
+    "profile:vertical": "tsx tests/vertical.test.ts",
+    "profile:horizontal": "tsx tests/horizontal.test.ts",
+    "test:vertical": "tsx tests/vertical.test.ts",
+    "test:horizontal": "tsx tests/horizontal.test.ts",
+    "test": "tsx tests/vertical.test.ts --quick"
   },
   "dependencies": {
     "@notifkit/provider-console": "file:../packages/provider-console",

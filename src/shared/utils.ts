@@ -1,8 +1,6 @@
-export function getPriorityBucket(
-  priority: string | undefined,
-): "critical" | "high" | "normal" | "low" {
+export function getPriorityBucket(priority: string | undefined): "critical" | "normal" | "low" {
   const p = priority || "normal";
-  return p === "critical" || p === "high" ? "critical" : p === "low" ? "low" : "normal";
+  return p === "critical" ? "critical" : p === "low" ? "low" : "normal";
 }
 
 /**

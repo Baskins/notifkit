@@ -1,83 +1,78 @@
-# Notifkit Profiling & Benchmarking Suite
+# Notifkit Profiling & Scaling Benchmarks
 
-This folder provides a realistic, container-isolated profiling and benchmarking environment for Notifkit.
-
----
-
-## 🏗️ Architecture & Resource Constraints
-
-The environment simulates a standard small production node (e.g. $15/mo cloud VM):
-
-- **Server**: 1.0 vCPU, 1 GB RAM (`notifkit` standalone orchestrator)
-- **PostgreSQL 15**: 0.5 vCPU, 512 MB RAM
-- **Redis 7**: 0.5 vCPU, 256 MB RAM
+Simplified profiling suite for Notifkit with two focused scaling profilers.
 
 ---
 
-## 🚀 Quick Start
+## 1. Vertical Scaling Profiler ($20 to $100)
 
-### 1. Install Dependencies
+Scales a single monolith server from 1 vCPU up to 5 vCPUs with matching database and Redis capacities.
+
+### Architecture by Tier
+
+| Budget      | Server (Monolith)  | Database         | Redis            |
+| ----------- | ------------------ | ---------------- | ---------------- |
+| **$20/mo**  | 1.0 vCPU, 1 GB RAM | 0.5 vCPU, 512 MB | 0.5 vCPU, 256 MB |
+| **$40/mo**  | 2.0 vCPU, 2 GB RAM | 1.0 vCPU, 1 GB   | 0.5 vCPU, 512 MB |
+| **$60/mo**  | 3.0 vCPU, 3 GB RAM | 1.5 vCPU, 1.5 GB | 1.0 vCPU, 1 GB   |
+| **$80/mo**  | 4.0 vCPU, 4 GB RAM | 2.0 vCPU, 2 GB   | 1.0 vCPU, 1 GB   |
+| **$100/mo** | 5.0 vCPU, 6 GB RAM | 2.5 vCPU, 3 GB   | 1.5 vCPU, 1.5 GB |
+
+### Run Command
 
 ```bash
-cd profiling
-npm install
+npm run profile:vertical
 ```
 
-### 2. Run the Load Test
+Options:
 
 ```bash
-npm run test:load
+npm run profile:vertical -- --quick                    # 5s test per tier, 1 run
+npm run profile:vertical -- --duration=15 --runs=3     # Custom duration and iterations
+npm run profile:vertical -- --tiers=20,40,100          # Run specific tiers
 ```
-
-The load test will:
-
-1. Boot the isolated 3-container stack (`postgres`, `redis`, `server`) via `testcontainers`.
-2. Run database schema migrations and seed project/template data.
-3. Fire 50 concurrent virtual users generating notifications against `/v1/notify`.
-4. Stream and buffer container logs until 100% of messages are delivered to the transport.
-5. Output detailed throughput, p95, and p99 percentiles for both API ingestion and background delivery.
-6. Automatically clean up and shut down the containers.
 
 ---
 
-### 3. Run the CPU Scaling Benchmark
+## 2. Horizontal Scaling Profiler ($20 to $100)
 
-Evaluate server performance scaling from 0.5 vCPU up to 4.0 vCPUs:
+Scales horizontally by distributing distinct microservices across dedicated server nodes.
+
+### Service Distribution by Tier
+
+| Budget      | Topology  | Distributed Nodes & Roles                                                                                                                           |
+| ----------- | --------- | --------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **$20/mo**  | 1 Server  | `monolith-server` (api, enricher, engine, delivery, scheduler)                                                                                      |
+| **$40/mo**  | 2 Servers | `api-server-1` (api)<br>`worker-server` (enricher, engine, delivery, scheduler)                                                                     |
+| **$60/mo**  | 3 Servers | `api-server-1` (api)<br>`pipeline-worker` (enricher, engine, scheduler)<br>`delivery-worker` (delivery)                                             |
+| **$80/mo**  | 4 Servers | `api-server-1` (api)<br>`enricher-worker` (enricher, scheduler)<br>`engine-worker` (engine)<br>`delivery-worker` (delivery)                         |
+| **$100/mo** | 5 Servers | `api-server-1` (api)<br>`api-server-2` (api)<br>`enricher-worker` (enricher, scheduler)<br>`engine-worker` (engine)<br>`delivery-worker` (delivery) |
+
+### Run Command
 
 ```bash
-npm run test:scaling
+npm run profile:horizontal
 ```
 
-#### CLI Flags & Customization:
+Options:
 
 ```bash
-# Rapid test (5s duration per tier)
-npm run test:scaling -- --quick
-
-# Specify custom CPU tiers
-npm run test:scaling -- --cpus=0.5,1.0,2.0,4.0
-
-# Customize duration and concurrency
-npm run test:scaling -- --duration=15 --concurrency=100
+npm run profile:horizontal -- --quick                  # 5s test per tier, 1 run
+npm run profile:horizontal -- --duration=15 --runs=3   # Custom duration and iterations
+npm run profile:horizontal -- --tiers=40,80,100        # Run specific tiers
 ```
-
-The scaling benchmark produces an aggregated comparative table with:
-
-- Ingestion Throughput (`req/sec`)
-- Active Delivery Throughput (`msgs/sec`)
-- Wall Drain Throughput (`msgs/sec`)
-- API & Delivery Latencies (`p50`, `p95`, `p99`)
-- Speedup vs Baseline & Diminishing Returns Analysis
 
 ---
 
-## ➕ Adding New Profiling Tests
+## Output Metrics
 
-To add a new benchmark (e.g. batch delivery, quiet hours queuing, multi-channel fallback):
+Both profilers output:
 
-1. Create a new test file under `tests/` (e.g. `tests/batch.test.ts`).
-2. Add a corresponding script to `package.json`:
-   ```json
-   "test:batch": "tsx tests/batch.test.ts"
-   ```
-3. Run `npm run test:batch`.
+- **Ingestion Throughput** (`req/s`)
+- **Active Delivery Rate** (`msg/s`)
+- **Wall Drain Rate** (`msg/s`)
+- **API Latency** (`p50`, `p95`, `p99`)
+- **Delivery Latency** (`p50`, `p95`, `p99`)
+- **Cost Efficiency** (`msg/s per $`)
+- Statistical aggregation across runs (Mean, Median, Min, Max, StdDev)
+- JSON export in `results/`

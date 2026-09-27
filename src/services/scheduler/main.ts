@@ -141,12 +141,8 @@ export async function executeSchedulerPoll(
       .where(inArray(scheduledPayloads.taskId, taskIds));
     const payloadMap = new Map(dbPayloads.map((row: any) => [row.taskId, row.payload]));
 
-    const batchedEvents: Record<
-      "critical" | "high" | "normal" | "low",
-      Omit<any, "id" | "timestamp">[]
-    > = {
+    const batchedEvents: Record<"critical" | "normal" | "low", Omit<any, "id" | "timestamp">[]> = {
       critical: [],
-      high: [],
       normal: [],
       low: [],
     };
