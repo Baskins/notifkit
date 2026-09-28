@@ -35,11 +35,11 @@ jobs:
       - name: Typecheck
         run: npm run typecheck
 
-      - name: Typecheck workspace packages
-        run: npm run typecheck:workspaces
-
       - name: Build
         run: npm run build
+
+      - name: Typecheck workspace packages
+        run: npm run typecheck:workspaces
 
       - name: Lint
         # Not `npm run lint` — that script carries --fix, which would paper over

@@ -70,7 +70,7 @@
     "typecheck": "tsc --noEmit",
     "typecheck:workspaces": "npm run typecheck --workspaces --if-present",
     "prepare": "husky",
-    "prepublishOnly": "npm run typecheck && npm run typecheck:workspaces && npm run build && npm run build:dashboard"
+    "prepublishOnly": "npm run typecheck && npm run build && npm run typecheck:workspaces && npm run build:dashboard"
   },
   "dependencies": {
     "ai": "^7.0.118",
