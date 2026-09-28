@@ -178,7 +178,7 @@ export function registerTools(server: McpServer, api: NotifkitApi): void {
             "Send to every user opted in to this topic. Mutually exclusive with user and segment.",
           ),
         data: z
-          .record(z.unknown())
+          .record(z.string(), z.unknown())
           .optional()
           .describe("Variables interpolated into the template's {{placeholders}}."),
         channels: z
@@ -271,7 +271,7 @@ export function registerTools(server: McpServer, api: NotifkitApi): void {
             "Recipient email addresses (alias for recipients when sending on email channel).",
           ),
         data: z
-          .record(z.unknown())
+          .record(z.string(), z.unknown())
           .optional()
           .describe("Variables interpolated into the template, shared by every recipient."),
         priority: z
@@ -682,10 +682,10 @@ export function registerTools(server: McpServer, api: NotifkitApi): void {
           .optional()
           .describe("Topic(s) this template belongs to, used for per-user topic opt-outs."),
         content: z
-          .record(z.unknown())
+          .record(z.string(), z.unknown())
           .describe("Channel-specific fields, e.g. { subject, body } for email."),
         aiPrompts: z
-          .record(z.string())
+          .record(z.string(), z.string())
           .optional()
           .describe("Optional per-field LLM prompts applied before rendering."),
       },
@@ -777,13 +777,13 @@ export function registerTools(server: McpServer, api: NotifkitApi): void {
       inputSchema: {
         id: z.string().optional().describe("Template id to fetch and preview."),
         content: z
-          .record(z.unknown())
+          .record(z.string(), z.unknown())
           .optional()
           .describe(
             "Raw template content object (e.g. { subject, body }) to render without saving.",
           ),
         data: z
-          .record(z.unknown())
+          .record(z.string(), z.unknown())
           .optional()
           .describe("Sample variable data to interpolate into the template's placeholders."),
         channel: z
@@ -808,11 +808,11 @@ export function registerTools(server: McpServer, api: NotifkitApi): void {
       inputSchema: {
         id: z.string().optional().describe("Template id to fetch and render."),
         content: z
-          .record(z.unknown())
+          .record(z.string(), z.unknown())
           .optional()
           .describe("Raw template content object to render."),
         data: z
-          .record(z.unknown())
+          .record(z.string(), z.unknown())
           .optional()
           .describe("Variables to interpolate into placeholders."),
         channel: z
@@ -934,10 +934,10 @@ export function registerTools(server: McpServer, api: NotifkitApi): void {
         preferences: z
           .object({
             channels: z
-              .record(z.boolean())
+              .record(z.string(), z.boolean())
               .optional()
               .describe("Per-channel opt-in map, e.g. { email: true, sms: false }."),
-            topics: z.record(z.boolean()).optional().describe("Per-topic opt-in map."),
+            topics: z.record(z.string(), z.boolean()).optional().describe("Per-topic opt-in map."),
             quietHours: z
               .array(
                 z.object({
@@ -1005,10 +1005,10 @@ export function registerTools(server: McpServer, api: NotifkitApi): void {
         preferences: z
           .object({
             channels: z
-              .record(z.boolean())
+              .record(z.string(), z.boolean())
               .optional()
               .describe("Per-channel opt-in map, e.g. { email: true, sms: false }."),
-            topics: z.record(z.boolean()).optional().describe("Per-topic opt-in map."),
+            topics: z.record(z.string(), z.boolean()).optional().describe("Per-topic opt-in map."),
             quietHours: z
               .array(
                 z.object({
@@ -1130,10 +1130,10 @@ export function registerTools(server: McpServer, api: NotifkitApi): void {
       inputSchema: {
         userId: z.string().min(1).describe("User id."),
         channels: z
-          .record(z.boolean())
+          .record(z.string(), z.boolean())
           .optional()
           .describe("Per-channel opt-in map, e.g. { email: true, sms: false }."),
-        topics: z.record(z.boolean()).optional().describe("Per-topic opt-in map."),
+        topics: z.record(z.string(), z.boolean()).optional().describe("Per-topic opt-in map."),
         quietHours: z
           .array(
             z.object({
@@ -1172,7 +1172,7 @@ export function registerTools(server: McpServer, api: NotifkitApi): void {
               z.object({
                 action: z.literal("notify"),
                 payload: z
-                  .record(z.unknown())
+                  .record(z.string(), z.unknown())
                   .describe(
                     "Same shape as send_notification's arguments. Omit the target to use the instance's own user.",
                   ),
@@ -1239,7 +1239,10 @@ export function registerTools(server: McpServer, api: NotifkitApi): void {
           .min(1)
           .optional()
           .describe("User id this run is for. Notify steps default to them."),
-        input: z.record(z.unknown()).optional().describe("Data made available to the run's steps."),
+        input: z
+          .record(z.string(), z.unknown())
+          .optional()
+          .describe("Data made available to the run's steps."),
       },
       annotations: { title: "Trigger a workflow", readOnlyHint: false, idempotentHint: false },
     },
@@ -1294,7 +1297,7 @@ export function registerTools(server: McpServer, api: NotifkitApi): void {
       inputSchema: {
         name: z.string().min(1).describe("Event name, matching a workflow's waitForEvent step."),
         properties: z
-          .record(z.unknown())
+          .record(z.string(), z.unknown())
           .describe("Event payload. Include the user id the event is about."),
       },
       annotations: { title: "Ingest an event", readOnlyHint: false, idempotentHint: false },

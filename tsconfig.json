@@ -4,6 +4,10 @@
     "moduleResolution": "Bundler",
     "outDir": "./dist",
     "baseUrl": ".",
+    "declaration": false,
+    "declarationMap": false,
+    "sourceMap": false,
+    "inlineSources": false,
     "paths": {
       "@/*": ["./src/*"],
       "notifkit": ["./src/index.ts"]
@@ -12,11 +16,10 @@
   "include": [
     "src/**/*",
     "tests/**/*",
-    "packages/*/src/**/*",
     "vitest.config.ts",
     "tsdown.config.ts",
     "tsup.config.ts",
     "drizzle.config.ts"
   ],
-  "exclude": ["node_modules", "dist", "coverage", "packages/*/dist", "**/*.d.ts"]
+  "exclude": ["node_modules", "dist", "coverage", "packages/*/dist"]
 }

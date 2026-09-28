@@ -336,8 +336,8 @@ export class ApiRateLimiter {
     const currentKey = `${rlTag}:${bucketIndex}`;
     const prevKey = `${rlTag}:${prevBucket}`;
     const requested = state.batchSize;
-
-    const promise = (async () => {
+    let inFlightRef: Promise<number> | null = null;
+    const executeLease = async (): Promise<number> => {
       try {
         let granted: number;
         if (typeof this.redis.leaseApiRateLimit === "function") {
@@ -382,12 +382,14 @@ export class ApiRateLimiter {
         }
         return requested;
       } finally {
-        if (state.inFlightLease === promise) {
+        if (state.inFlightLease === inFlightRef) {
           state.inFlightLease = null;
         }
       }
-    })();
+    };
 
+    const promise = executeLease();
+    inFlightRef = promise;
     state.inFlightLease = promise;
     return promise;
   }
