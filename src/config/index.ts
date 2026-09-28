@@ -47,6 +47,17 @@ export const baseConfigSchema = z.object({
   ADMIN_PASSWORD: z.string().trim().min(6).optional(),
   ADMIN_USERNAME: z.string().trim().optional(),
   WORKER_CONCURRENCY: z.coerce.number().int().min(1).default(10),
+  /** In-flight sends per delivery worker. Defaults to WORKER_CONCURRENCY. */
+  DELIVERY_CONCURRENCY: z.coerce.number().int().min(1).optional(),
+  /**
+   * When enricher, engine and delivery run in the same process, hand
+   * single-recipient notifications from stage to stage in memory instead of
+   * through the enriched/outbound streams. See `NotifkitOptions.fusedPipeline`.
+   */
+  PIPELINE_FUSED: z
+    .string()
+    .optional()
+    .transform((v) => v === "true" || v === "1"),
   QUEUE_MAX_LEN: z.coerce.number().int().min(1).default(100000),
   DB_MAX_CONNECTIONS: z.coerce.number().int().min(1).default(2),
   LOG_FLUSH_INTERVAL_MS: z.coerce.number().int().min(50).default(500),

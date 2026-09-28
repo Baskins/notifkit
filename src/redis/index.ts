@@ -210,9 +210,18 @@ export const LUA_RENEW_LOCK = `
   return 0
 `;
 
-/** User-level sliding window notification throttle. */
+/**
+ * User-level sliding window notification throttle.
+ *
+ * A member already in the window was counted by an earlier attempt at the same
+ * message (a replay after a crash), so it is allowed again without counting
+ * twice. Returns 0 in that case, otherwise the would-be count.
+ */
 export const LUA_USER_THROTTLE = `
   redis.call("ZREMRANGEBYSCORE", KEYS[1], "-inf", ARGV[1])
+  if redis.call("ZSCORE", KEYS[1], ARGV[4]) then
+    return 0
+  end
   local count = redis.call("ZCARD", KEYS[1])
   if tonumber(count) < tonumber(ARGV[2]) then
     redis.call("ZADD", KEYS[1], tonumber(ARGV[3]), ARGV[4])
@@ -329,8 +338,46 @@ export interface RedisClientOptions {
   redisOptions?: Partial<RedisOptions>;
 }
 
+const sharedClients = new Map<string, { client: RedisClient; refs: number }>();
+
 export class RedisClient {
   readonly native: Redis;
+
+  /**
+   * One command connection per Redis URL for every service in this process.
+   *
+   * Each service used to open its own, so a single notification's commands
+   * reached Redis over three or four sockets, one round trip each. Sharing a
+   * connection lets auto-pipelining merge whatever the services issue in the
+   * same tick into one write, and Redis spends most of its time per round trip
+   * rather than per command. Blocking reads and subscribers still duplicate
+   * their own connections.
+   *
+   * The handle's `disconnect()` releases this caller's reference; the
+   * connection closes when the last service lets go.
+   */
+  static shared(options: RedisClientOptions): RedisClient {
+    let entry = sharedClients.get(options.url);
+    if (!entry) {
+      entry = { client: new RedisClient({ ...options, name: "notifkit" }), refs: 0 };
+      sharedClients.set(options.url, entry);
+    }
+    entry.refs++;
+
+    const owner = entry;
+    let released = false;
+    const handle = Object.create(owner.client) as RedisClient;
+    handle.disconnect = async () => {
+      if (released) return;
+      released = true;
+      owner.refs--;
+      if (owner.refs === 0) {
+        if (sharedClients.get(options.url) === owner) sharedClients.delete(options.url);
+        await owner.client.disconnect();
+      }
+    };
+    return handle;
+  }
 
   private readonly logger?: Logger;
   private isClosing = false;
@@ -343,6 +390,12 @@ export class RedisClient {
       enableReadyCheck: true,
       lazyConnect: false,
       connectionName: name,
+      // Every worker keeps hundreds of commands in flight (idempotency SETs,
+      // throttle scripts, acks). Coalescing the ones issued in the same tick
+      // into one write cuts syscalls and Redis read events by an order of
+      // magnitude under load. Blocking and subscriber connections opt out
+      // when they duplicate this client.
+      enableAutoPipelining: true,
       ...redisOptions,
     });
 

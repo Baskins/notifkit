@@ -15,17 +15,21 @@ import {
   registry,
   buildStreamEvent,
   type NotificationDispatchedPayload,
+  type RenderedContent,
+  PUBSUB_CHANNELS,
 } from "@/index.js";
 import { type StreamName } from "@/contracts/streams.js";
 import { createDatabase } from "@/db/index.js";
+import { upsertOutboxProviderIds } from "@/db/bulk.js";
 import { deliveryOutbox, scheduledPayloads } from "@/db/schema.js";
 import { sql as drizzleSql } from "drizzle-orm";
-import { ContactRepository, IdempotencyGuard } from "@/index.js";
+import { ContactRepository, IdempotencyGuard, TemplateRepository } from "@/index.js";
+import { renderWithTemplate, TemplateCache } from "@/templates/index.js";
 import { transportRegistry } from "@/index.js";
 import { globalEmitter, getPriorityBucket, type WorkerOptions } from "@/shared/index.js";
 import { startHealthReporter, NonRetryableError } from "@/workers/index.js";
 import { BatchProcessor, CircuitBreaker } from "@/shared/index.js";
-import { throttleProvider } from "./throttle.js";
+import { ProviderThrottle } from "./throttle.js";
 import { metrics } from "@/metrics/index.js";
 
 // ─── App-specific config ────────────────────────────────────────────────────
@@ -48,6 +52,7 @@ let worker: BaseWorker;
 let scheduledProducer: StreamProducer;
 let enrichedProducers: Record<string, StreamProducer>;
 let healthInterval: NodeJS.Timeout | null = null;
+let subscriber: Redis | null = null;
 
 (global as any)._telemetry = (global as any)._telemetry || {
   count: 0,
@@ -60,6 +65,9 @@ let healthInterval: NodeJS.Timeout | null = null;
   flushCount: 0,
 };
 
+/** How long a send may run before its dispatched log entry is published alone. */
+const DISPATCH_LOG_DELAY_MS = 1_000;
+
 export interface DeliveryWorkerOptions extends WorkerOptions {
   transportRegistry: any;
   idempotency: any;
@@ -70,12 +78,14 @@ export interface DeliveryWorkerOptions extends WorkerOptions {
   eventsProducer: any;
   globalEmitter: any;
   db: any;
+  providerThrottle?: ProviderThrottle;
+  /** Renders tasks that arrive without `renderedContent`. */
+  templateCache?: TemplateCache;
 }
 
 export class DeliveryWorker extends BaseWorker {
   private readonly transportRegistry: any;
   private readonly idempotency: any;
-  private readonly redisCli: Redis;
   private readonly scheduledProducer: any;
   private readonly enrichedProducers: any;
   private readonly contactRepo: any;
@@ -87,48 +97,61 @@ export class DeliveryWorker extends BaseWorker {
   private outboxUpdateProcessor: BatchProcessor<any, void>;
   private outboxInsertProcessor: BatchProcessor<any, boolean>;
   private breakers = new Map<string, CircuitBreaker>();
+  private readonly providerThrottle: ProviderThrottle;
+  private readonly templateCache?: TemplateCache;
 
   constructor(options: DeliveryWorkerOptions) {
     super(options);
     this.transportRegistry = options.transportRegistry;
     this.idempotency = options.idempotency;
-    this.redisCli = options.redis;
     this.scheduledProducer = options.scheduledProducer;
     this.enrichedProducers = options.enrichedProducers;
     this.contactRepo = options.contactRepo;
     this.eventsProducer = options.eventsProducer;
     this.globalEmitter = options.globalEmitter;
     this.db = options.db;
+    this.providerThrottle =
+      options.providerThrottle ?? new ProviderThrottle(options.redis, this.logger);
+    this.templateCache = options.templateCache;
 
-    const batchSize = Math.max(10, Math.min(options.concurrency ?? 50, 100));
+    // Every message waits on these flushes before it is acked, so they bound
+    // the worker's throughput: allow a few in flight and let batches grow with
+    // the configured concurrency.
+    const batchSize = Math.max(10, Math.min(options.concurrency ?? 50, 500));
+    const flushConcurrency = 4;
 
-    this.eventProcessor = new BatchProcessor<any, void>(batchSize, 5, async (events) => {
-      await this.eventsProducer.publishBatch(events);
-      return events.map(() => undefined as void);
-    });
+    this.eventProcessor = new BatchProcessor<any, void>(
+      batchSize,
+      5,
+      async (events) => {
+        await this.eventsProducer.publishBatch(events);
+        return events.map(() => undefined as void);
+      },
+      flushConcurrency,
+    );
 
-    this.outboxUpdateProcessor = new BatchProcessor<any, void>(batchSize, 5, async (updates) => {
-      const values = updates.map((update) => ({
-        taskId: update.taskId,
-        channel: update.channel,
-        destination: update.destination,
-        providerMessageId: update.providerMessageId,
-      }));
+    this.outboxUpdateProcessor = new BatchProcessor<any, void>(
+      batchSize,
+      5,
+      async (updates) => {
+        const values = updates.map((update) => ({
+          taskId: update.taskId,
+          channel: update.channel,
+          destination: update.destination,
+          providerMessageId: update.providerMessageId,
+        }));
 
-      const tDbUpdateStart = Date.now();
-      await this.db
-        .insert(deliveryOutbox)
-        .values(values)
-        .onConflictDoUpdate({
-          target: [deliveryOutbox.taskId, deliveryOutbox.channel, deliveryOutbox.destination],
-          set: { providerMessageId: drizzleSql`EXCLUDED.provider_message_id` },
-        })
-        .catch((e: any) => this.logger.error({ err: e }, "background update failed"));
+        const tDbUpdateStart = Date.now();
+        await upsertOutboxProviderIds(this.db, values).catch((e: any) =>
+          this.logger.error({ err: e }, "background update failed"),
+        );
 
-      (global as any)._telemetry.dbupdate += Date.now() - tDbUpdateStart;
-      (global as any)._telemetry.flushCount++;
-      return updates.map(() => undefined as void);
-    });
+        (global as any)._telemetry.dbupdate += Date.now() - tDbUpdateStart;
+        (global as any)._telemetry.flushCount++;
+        return updates.map(() => undefined as void);
+      },
+      flushConcurrency,
+    );
 
     this.outboxInsertProcessor = new BatchProcessor(batchSize, 5, async (tasks) => {
       const values = tasks.map((task: any) => ({
@@ -149,6 +172,23 @@ export class DeliveryWorker extends BaseWorker {
       this.outboxInsertProcessor.flush(),
     ]);
     await super.stop();
+  }
+
+  /**
+   * Renders a task the engine dispatched unrendered. Done here, after the
+   * throttle and the lease, so the body is built once per actual send and never
+   * travels through the outbound stream.
+   */
+  private async render(task: NotificationDispatchedPayload): Promise<RenderedContent> {
+    if (!task.templateId) return renderWithTemplate(null, task.templateVariables);
+    const template = this.templateCache
+      ? await this.templateCache.getCachedTemplate(task.projectId, task.templateId)
+      : null;
+    if (!template) {
+      // The engine checked it existed; it was deleted since. Retrying won't help.
+      throw new NonRetryableError(`template "${task.templateId}" not found at send time`);
+    }
+    return renderWithTemplate(template, task.templateVariables);
   }
 
   private getBreaker(name: string): CircuitBreaker {
@@ -259,11 +299,9 @@ export class DeliveryWorker extends BaseWorker {
 
     const limitConfig = transports[0].limits;
     if (limitConfig) {
-      const { allowed, retryAfterMs } = await throttleProvider(
-        this.redisCli,
+      const { allowed, retryAfterMs } = await this.providerThrottle.check(
         task.channel,
         limitConfig,
-        this.logger,
       );
       if (!allowed) {
         task.throttleAttemptCount = (task.throttleAttemptCount ?? 0) + 1;
@@ -365,28 +403,58 @@ export class DeliveryWorker extends BaseWorker {
     const tDispatchStart = Date.now();
     const MAX_DISPATCH_BUDGET_MS = 25_000; // Strictly shorter than lock lease (30s)
 
-    try {
-      publishPromises.push(
-        this.eventProcessor.add(
-          buildStreamEvent(
-            "notification.dispatched",
-            {
-              projectId: task.projectId,
-              taskId: task.taskId,
-              enrichedEventId: task.enrichedEventId,
-              recipientId: task.recipientId,
-              channel: task.channel,
-              templateId: task.templateId,
-              attempt,
-              workflowInstanceId:
-                event.metadata.source === "workflow" ? event.metadata.traceId : undefined,
-              campaignId: task.campaignId,
-            },
-            "delivery",
-            event.metadata.traceId,
-          ),
+    // The attempt's `dispatched` log entry normally rides on its outcome event,
+    // one stream entry instead of two. A send still running after
+    // DISPATCH_LOG_DELAY_MS is logged on its own, so a slow or stuck attempt is
+    // visible while it is in flight, as it always was.
+    let dispatchStarted = false;
+    let dispatchLogged = false;
+    let dispatchedAt = "";
+    let dispatchLogTimer: NodeJS.Timeout | undefined;
+    const logDispatched = (): Promise<void> | undefined => {
+      clearTimeout(dispatchLogTimer);
+      if (!dispatchStarted || dispatchLogged) return undefined;
+      dispatchLogged = true;
+      const logged = this.eventProcessor.add(
+        buildStreamEvent(
+          "notification.dispatched",
+          {
+            projectId: task.projectId,
+            taskId: task.taskId,
+            enrichedEventId: task.enrichedEventId,
+            recipientId: task.recipientId,
+            channel: task.channel,
+            templateId: task.templateId,
+            attempt,
+            workflowInstanceId:
+              event.metadata.source === "workflow" ? event.metadata.traceId : undefined,
+            campaignId: task.campaignId,
+          },
+          "delivery",
+          event.metadata.traceId,
         ),
       );
+      publishPromises.push(logged);
+      return logged;
+    };
+    /** Outcome payload, carrying the dispatched entry if it has not gone out. */
+    const outcome = <T extends Record<string, unknown>>(payload: T): T => {
+      clearTimeout(dispatchLogTimer);
+      if (dispatchLogged) return payload;
+      dispatchLogged = true;
+      return { ...payload, attempt, dispatchedAt };
+    };
+
+    try {
+      if (!task.renderedContent) {
+        task.renderedContent = await this.render(task);
+      }
+
+      dispatchStarted = true;
+      dispatchedAt = new Date().toISOString();
+      dispatchLogTimer = setTimeout(() => {
+        void logDispatched();
+      }, DISPATCH_LOG_DELAY_MS);
 
       // For push: we just need to send to the pre-resolved destination,
       // but if it's invalid, we deactivate it.
@@ -475,7 +543,7 @@ export class DeliveryWorker extends BaseWorker {
             this.eventProcessor.add(
               buildStreamEvent(
                 "notification.failed",
-                {
+                outcome({
                   projectId: task.projectId,
                   taskId: task.taskId,
                   enrichedEventId: task.enrichedEventId,
@@ -489,7 +557,7 @@ export class DeliveryWorker extends BaseWorker {
                   workflowInstanceId:
                     event.metadata.source === "workflow" ? event.metadata.traceId : undefined,
                   campaignId: task.campaignId,
-                },
+                }),
                 "delivery",
                 event.metadata.traceId,
               ),
@@ -530,7 +598,7 @@ export class DeliveryWorker extends BaseWorker {
             this.eventProcessor.add(
               buildStreamEvent(
                 "notification.delivered",
-                {
+                outcome({
                   projectId: task.projectId,
                   taskId: task.taskId,
                   enrichedEventId: task.enrichedEventId,
@@ -541,7 +609,7 @@ export class DeliveryWorker extends BaseWorker {
                   workflowInstanceId:
                     event.metadata.source === "workflow" ? event.metadata.traceId : undefined,
                   campaignId: task.campaignId,
-                },
+                }),
                 "delivery",
                 event.metadata.traceId,
               ),
@@ -574,7 +642,7 @@ export class DeliveryWorker extends BaseWorker {
             this.eventProcessor.add(
               buildStreamEvent(
                 "notification.failed",
-                {
+                outcome({
                   projectId: task.projectId,
                   taskId: task.taskId,
                   enrichedEventId: task.enrichedEventId,
@@ -588,7 +656,7 @@ export class DeliveryWorker extends BaseWorker {
                   workflowInstanceId:
                     event.metadata.source === "workflow" ? event.metadata.traceId : undefined,
                   campaignId: task.campaignId,
-                },
+                }),
                 "delivery",
                 event.metadata.traceId,
               ),
@@ -679,7 +747,7 @@ export class DeliveryWorker extends BaseWorker {
             this.eventProcessor.add(
               buildStreamEvent(
                 "notification.delivered",
-                {
+                outcome({
                   projectId: task.projectId,
                   taskId: task.taskId,
                   enrichedEventId: task.enrichedEventId,
@@ -690,7 +758,7 @@ export class DeliveryWorker extends BaseWorker {
                   workflowInstanceId:
                     event.metadata.source === "workflow" ? event.metadata.traceId : undefined,
                   campaignId: task.campaignId,
-                },
+                }),
                 "delivery",
                 event.metadata.traceId,
               ),
@@ -710,7 +778,7 @@ export class DeliveryWorker extends BaseWorker {
             this.eventProcessor.add(
               buildStreamEvent(
                 "notification.failed",
-                {
+                outcome({
                   projectId: task.projectId,
                   taskId: task.taskId,
                   enrichedEventId: task.enrichedEventId,
@@ -723,7 +791,7 @@ export class DeliveryWorker extends BaseWorker {
                   workflowInstanceId:
                     event.metadata.source === "workflow" ? event.metadata.traceId : undefined,
                   campaignId: task.campaignId,
-                },
+                }),
                 "delivery",
                 event.metadata.traceId,
               ),
@@ -750,12 +818,15 @@ export class DeliveryWorker extends BaseWorker {
             throw new NonRetryableError(result.error ?? "delivery failed");
           }
         } else {
-          this.logger.info(
+          this.logger.debug(
             { taskId: task.taskId, channel: task.channel, messageId: result.providerMessageId },
             "notification delivered",
           );
         }
       }
+
+      // Every branch above publishes an outcome; this only guards one that doesn't.
+      void logDispatched();
 
       const tFlushStart = Date.now();
       await Promise.all(publishPromises).catch((err) => {
@@ -795,6 +866,8 @@ export class DeliveryWorker extends BaseWorker {
         t.flushCount = 0;
       }
     } catch (err) {
+      // The attempt happened even though it did not finish; keep it in the log.
+      logDispatched()?.catch(() => {});
       await this.idempotency.unmark(idempotencyKey).catch(() => {});
       throw err;
     }
@@ -804,10 +877,13 @@ export class DeliveryWorker extends BaseWorker {
 export async function startDeliveryWorker() {
   logger = createLogger({ name: "delivery", level: config.LOG_LEVEL });
 
-  redis = new RedisClient({ url: config.REDIS_URL, name: "delivery", logger });
+  redis = RedisClient.shared({ url: config.REDIS_URL, name: "delivery", logger });
   const dbData = createDatabase({ url: config.DATABASE_URL, applicationName: "delivery", logger });
   sql = dbData.sql;
   db = dbData.db;
+  // Delivery spends most of its time waiting on providers, so it needs far
+  // more messages in flight than the CPU-bound stages do.
+  const deliveryConcurrency = config.DELIVERY_CONCURRENCY ?? config.WORKER_CONCURRENCY;
   const consumerId = `delivery-${process.env.HOSTNAME || process.pid}-${Math.random().toString(36).slice(2, 8)}`;
   consumer = new StreamConsumer({
     redis: redis.native,
@@ -815,8 +891,9 @@ export async function startDeliveryWorker() {
     group: CONSUMER_GROUPS.DELIVERY,
     consumer: consumerId,
     dlqStream: STREAMS.DEAD_LETTER,
-    batchSize: config.WORKER_CONCURRENCY,
+    batchSize: deliveryConcurrency,
     bufferAcks: true,
+    coalesceMs: 2,
     logger,
   });
 
@@ -845,6 +922,7 @@ export async function startDeliveryWorker() {
   };
 
   const contactRepo = new ContactRepository(db);
+  const templateCache = new TemplateCache(new TemplateRepository(db));
 
   const idempotency = new IdempotencyGuard({
     redis: redis.native,
@@ -870,7 +948,7 @@ export async function startDeliveryWorker() {
     consumer,
     pendingScanner,
     logger,
-    concurrency: config.WORKER_CONCURRENCY,
+    concurrency: deliveryConcurrency,
     transportRegistry,
     idempotency,
     redis: redis.native,
@@ -880,7 +958,13 @@ export async function startDeliveryWorker() {
     eventsProducer,
     globalEmitter,
     db,
+    templateCache,
   });
+
+  // Delivery renders templates now, so it has to hear about edits too.
+  subscriber = redis.native.duplicate({ enableAutoPipelining: false });
+  await subscriber.subscribe(PUBSUB_CHANNELS.TEMPLATE_INVALIDATED);
+  subscriber.on("message", (_channel: string, key: string) => templateCache.invalidateKey(key));
 
   // ─── Health check interval ──────────────────────────────────────────────────
 
@@ -893,6 +977,10 @@ export async function startDeliveryWorker() {
   await worker.start();
 }
 
+export function getDeliveryWorker(): DeliveryWorker | undefined {
+  return worker as DeliveryWorker | undefined;
+}
+
 // ─── Shutdown ──────────────────────────────────────────────────────────────
 
 export async function stopDeliveryWorker(): Promise<void> {
@@ -900,6 +988,10 @@ export async function stopDeliveryWorker(): Promise<void> {
   if (healthInterval) {
     clearInterval(healthInterval);
     healthInterval = null;
+  }
+  if (subscriber) {
+    subscriber.disconnect();
+    subscriber = null;
   }
   if (worker) await worker.stop();
   if (sql) await sql.end();

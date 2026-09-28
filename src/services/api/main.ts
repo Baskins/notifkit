@@ -258,7 +258,7 @@ export async function startApiServer() {
     process.exit(1);
   }
 
-  redis = new RedisClient({ url: config.REDIS_URL, name: "api", logger });
+  redis = RedisClient.shared({ url: config.REDIS_URL, name: "api", logger });
   apiRateLimiter = new ApiRateLimiter({
     redis: redis.native,
     windowMs: API_RATE_LIMIT_WINDOW_MS,
@@ -666,7 +666,7 @@ export async function startApiServer() {
   }
 
   // Let key rotation take effect immediately instead of waiting out the TTL.
-  authSubscriber = redis.native.duplicate();
+  authSubscriber = redis.native.duplicate({ enableAutoPipelining: false });
   await authSubscriber.subscribe(API_KEY_INVALIDATION_CHANNEL);
   authSubscriber.on("message", (channel: string, tokenHash: string) => {
     if (channel !== API_KEY_INVALIDATION_CHANNEL) return;

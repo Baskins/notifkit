@@ -15,5 +15,7 @@ export const NotificationFailedPayloadSchema = z.object({
   workflowInstanceId: z.string().uuid().optional(),
   /** Campaign this message belongs to, carried from the originating request. */
   campaignId: z.string().min(1).max(128).optional(),
+  /** See NotificationDeliveredPayload.dispatchedAt. */
+  dispatchedAt: z.string().datetime().optional(),
 });
 export type NotificationFailedPayload = z.infer<typeof NotificationFailedPayloadSchema>;

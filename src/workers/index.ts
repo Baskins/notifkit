@@ -1,5 +1,5 @@
 import type { Logger } from "@/index.js";
-import type { StreamConsumer, PendingMessageScanner, StreamMessage } from "@/index.js";
+import type { StreamConsumer, PendingMessageScanner, StreamMessage, StreamEvent } from "@/index.js";
 import { globalEmitter, AsyncSemaphore } from "@/shared/index.js";
 import { metrics } from "@/metrics/index.js";
 export * from "./health.js";
@@ -186,6 +186,46 @@ export abstract class BaseWorker {
       // reporter never blocks on Redis.
       pendingCount: this.lastPendingCount,
     };
+  }
+
+  /**
+   * Processes an event produced by an upstream stage in this same process,
+   * skipping the stream hop in between.
+   *
+   * The caller is still holding its own stream entry, and does not ack it until
+   * this returns. A thrown error therefore leaves that entry pending and the
+   * whole chain is replayed from the upstream stage; the idempotency keys each
+   * stage already checks make the replay safe. Non-retryable failures go to the
+   * dead-letter stream here, as they would have from this worker's own stream,
+   * so they do not send the upstream message there instead.
+   */
+  async processInline(event: StreamEvent): Promise<void> {
+    try {
+      // `{ ack: false }` means another holder owns this message right now. Its
+      // own stream entry is what gets retried if it fails, so there is nothing
+      // for the caller to wait on.
+      await this.process({ id: event.id, event, deliveryCount: 1, inline: true }, 1);
+      this.processedCount += 1;
+      this.lastProcessedAt = new Date().toISOString();
+      metrics.messagesProcessed.inc({ worker: this.constructor.name, status: "success" });
+    } catch (err) {
+      if (err instanceof LockHeldError || (err as any)?.lockHeld) return;
+
+      this.errorCount += 1;
+      this.lastErrorAt = new Date().toISOString();
+      metrics.messagesProcessed.inc({ worker: this.constructor.name, status: "error" });
+
+      if (err instanceof NonRetryableError || (err as any)?.nonRetryable) {
+        this.logger.warn(
+          { err, eventId: event.id },
+          "non-retryable error on inline message — moving to dead-letter queue",
+        );
+        await this.consumer.deadLetter(event);
+        globalEmitter.emit("notification:failed", event.id, (err as Error).message, event.type);
+        return;
+      }
+      throw err;
+    }
   }
 
   private async processWithTracking(message: StreamMessage): Promise<void> {

@@ -1,78 +1,84 @@
-# Notifkit Profiling & Scaling Benchmarks
+# Notifkit Profiling
 
-Simplified profiling suite for Notifkit with two focused scaling profilers.
-
----
-
-## 1. Vertical Scaling Profiler ($20 to $100)
-
-Scales a single monolith server from 1 vCPU up to 5 vCPUs with matching database and Redis capacities.
-
-### Architecture by Tier
-
-| Budget      | Server (Monolith)  | Database         | Redis            |
-| ----------- | ------------------ | ---------------- | ---------------- |
-| **$20/mo**  | 1.0 vCPU, 1 GB RAM | 0.5 vCPU, 512 MB | 0.5 vCPU, 256 MB |
-| **$40/mo**  | 2.0 vCPU, 2 GB RAM | 1.0 vCPU, 1 GB   | 0.5 vCPU, 512 MB |
-| **$60/mo**  | 3.0 vCPU, 3 GB RAM | 1.5 vCPU, 1.5 GB | 1.0 vCPU, 1 GB   |
-| **$80/mo**  | 4.0 vCPU, 4 GB RAM | 2.0 vCPU, 2 GB   | 1.0 vCPU, 1 GB   |
-| **$100/mo** | 5.0 vCPU, 6 GB RAM | 2.5 vCPU, 3 GB   | 1.5 vCPU, 1.5 GB |
-
-### Run Command
+Production-shaped throughput benchmarks for notifkit, run on Docker with CPU and
+memory limits per container.
 
 ```bash
-npm run profile:vertical
+npm run profile:vertical      # one monolith per tier, 1 → 5 vCPU
+npm run profile:horizontal    # API nodes + identical 1 vCPU pipeline workers
 ```
 
-Options:
+Docker must be running. Each suite first builds notifkit's `dist/` and the node
+image from it (`--skip-build` / `--skip-dist` to reuse them).
+
+## What a run does
+
+Every tier gets a fresh environment and three phases:
+
+| Phase      | Setup                                                                                                    | Answers                                                                                               |
+| ---------- | -------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------- |
+| **ingest** | Only the API serves; worker services wait behind a gate. k6 closed-loop VUs.                             | The most `POST /v1/notify` the API accepts. Everything accepted is queued.                            |
+| **drain**  | Gate opens; workers work through that backlog.                                                           | The most the pipeline delivers per second, and whether `message_logs` keeps up.                       |
+| **steady** | Everything running; k6 open-model arrivals at a fixed rate (default: 80% of the lower of the two above). | Whether delivery keeps up with production-style traffic, and the end-to-end latency a recipient sees. |
+
+What makes it production-shaped:
+
+- **Load comes from inside the compose network.** It never goes through Docker Desktop's host port proxy, and the load generator doesn't share an event loop with anything being measured.
+- **Deliveries are counted in-process.** The profiling transport counts them and flushes to Redis four times a second, with no per-message logging.
+- **The traffic is realistic.** It spreads across 100k seeded users (more than the repositories' 5k-entry caches hold) and 8 templates, some with topics, so they get signed unsubscribe headers. The mix is 35% critical, 40% normal and 25% low priority.
+- **The providers are realistic.** The simulated provider takes 150–250 ms (`--latency=`).
+- **The `events` service runs**, so `message_logs` gets two rows per delivery, as in production.
+- **Configuration matches production:**
+  - `NODE_ENV=production` and `LOG_LEVEL=info`.
+  - Postgres runs with `shared_buffers` and friends scaled to the tier's memory, plus `pg_stat_statements`.
+  - Redis runs with AOF, `appendfsync everysec`.
+
+## Output
+
+For each phase you get:
+
+- API latency percentiles from k6.
+- End-to-end latency, from request to provider accept.
+- Delivery rate and `message_logs` rows/s.
+- Per-container CPU (cores, and share of the container's limit) and memory.
+- Per-node event-loop delay.
+
+For the whole run you get Postgres table inserts, sizes, WAL, and the top statements by total time. A final table compares the tiers. Raw results are saved to `results/<suite>-<timestamp>.json`.
+
+The "busiest container" is the one closest to its CPU limit during steady state. That's usually the bottleneck. If a notifkit node sits at ~100% of one core with event-loop p99 climbing, that node is out of CPU.
+
+## Options
 
 ```bash
-npm run profile:vertical -- --quick                    # 5s test per tier, 1 run
-npm run profile:vertical -- --duration=15 --runs=3     # Custom duration and iterations
-npm run profile:vertical -- --tiers=20,40,100          # Run specific tiers
+--quick                 # 5s ingest, 10s steady, 10k users
+--ingest=15 --steady=30 # phase durations (s)
+--rate=5000             # steady-phase arrival rate instead of auto
+--users=100000          # seeded recipients
+--latency=150-250       # simulated provider latency (ms), fixed or range
+--fused                 # PIPELINE_FUSED=true: enricher → engine → delivery in-process
+--log-level=info
+--runs=3                # repeat each tier, report medians
+--tiers=20,60,100
+--keep                  # leave containers up afterwards
+--skip-build / --skip-dist
 ```
 
----
+## Topologies
 
-## 2. Horizontal Scaling Profiler ($20 to $100)
+**Vertical**: a single `server` container running `api, enricher, engine,
+delivery, scheduler, events`. It scales from 1 vCPU / 1 GB to 5 vCPU / 6 GB, with Postgres and Redis growing alongside.
 
-Scales horizontally by distributing distinct microservices across dedicated server nodes.
+**Horizontal**: 1 vCPU / 1 GB nodes.
 
-### Service Distribution by Tier
+| Budget | Nodes                        |
+| ------ | ---------------------------- |
+| $20    | the monolith baseline        |
+| $40    | `api-1` + `worker-1`         |
+| $60    | `api-1` + 2 workers          |
+| $80    | `api-1` + 3 workers          |
+| $100   | `api-1`, `api-2` + 3 workers |
 
-| Budget      | Topology  | Distributed Nodes & Roles                                                                                                                           |
-| ----------- | --------- | --------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **$20/mo**  | 1 Server  | `monolith-server` (api, enricher, engine, delivery, scheduler)                                                                                      |
-| **$40/mo**  | 2 Servers | `api-server-1` (api)<br>`worker-server` (enricher, engine, delivery, scheduler)                                                                     |
-| **$60/mo**  | 3 Servers | `api-server-1` (api)<br>`pipeline-worker` (enricher, engine, scheduler)<br>`delivery-worker` (delivery)                                             |
-| **$80/mo**  | 4 Servers | `api-server-1` (api)<br>`enricher-worker` (enricher, scheduler)<br>`engine-worker` (engine)<br>`delivery-worker` (delivery)                         |
-| **$100/mo** | 5 Servers | `api-server-1` (api)<br>`api-server-2` (api)<br>`enricher-worker` (enricher, scheduler)<br>`engine-worker` (engine)<br>`delivery-worker` (delivery) |
+Every worker runs the whole pipeline. That is how you'd scale it in production, and it lets `--fused` apply on every worker.
 
-### Run Command
-
-```bash
-npm run profile:horizontal
-```
-
-Options:
-
-```bash
-npm run profile:horizontal -- --quick                  # 5s test per tier, 1 run
-npm run profile:horizontal -- --duration=15 --runs=3   # Custom duration and iterations
-npm run profile:horizontal -- --tiers=40,80,100        # Run specific tiers
-```
-
----
-
-## Output Metrics
-
-Both profilers output:
-
-- **Ingestion Throughput** (`req/s`)
-- **Active Delivery Rate** (`msg/s`)
-- **Wall Drain Rate** (`msg/s`)
-- **API Latency** (`p50`, `p95`, `p99`)
-- **Delivery Latency** (`p50`, `p95`, `p99`)
-- **Cost Efficiency** (`msg/s per $`)
-- Statistical aggregation across runs (Mean, Median, Min, Max, StdDev)
-- JSON export in `results/`
+The notifkit, Postgres and Redis limits of the larger tiers add up to more than
+a laptop has. Treat numbers from a machine where the containers contend as a lower bound; the runner warns when the limits exceed Docker's CPUs.

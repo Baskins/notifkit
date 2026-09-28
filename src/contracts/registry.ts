@@ -3,7 +3,7 @@ import type { NotificationRequestedPayload } from "./events/notification-request
 import type { NotificationCreatedPayload } from "./events/notification-created.js";
 import type { NotificationEnrichedPayload } from "./events/notification-enriched.js";
 import type { NotificationScheduledPayload } from "./events/notification-scheduled.js";
-import type { NotificationDispatchedPayload } from "./events/notification-dispatched.js";
+import type { DispatchedTaskPayload } from "./events/notification-dispatched.js";
 import type { NotificationDeliveredPayload } from "./events/notification-delivered.js";
 import type { NotificationFailedPayload } from "./events/notification-failed.js";
 import type { NotificationSkippedPayload } from "./events/notification-skipped.js";
@@ -26,7 +26,7 @@ export interface EventPayloadMap {
   "notification.created": NotificationCreatedPayload;
   "notification.enriched": NotificationEnrichedPayload;
   "notification.scheduled": NotificationScheduledPayload;
-  "notification.dispatched": NotificationDispatchedPayload;
+  "notification.dispatched": DispatchedTaskPayload;
   "notification.delivered": NotificationDeliveredPayload;
   "notification.failed": NotificationFailedPayload;
   "notification.skipped": NotificationSkippedPayload;

@@ -129,6 +129,11 @@ export interface ThrottleCheckOptions {
   windowHours?: number | null;
   /** Future send time. The window is evaluated at that instant, not at now. */
   scheduledAt?: string;
+  /**
+   * Stable id of the message being counted. A retry of the same message is
+   * then counted once, not once per attempt. Random when omitted.
+   */
+  messageId?: string;
 }
 
 /** Reject stored values that would make the window meaningless. */
@@ -176,7 +181,7 @@ export class UserThrottle {
     const key = `throttle:${projectId}:user:${userId}`;
     const targetTime = options.scheduledAt ? new Date(options.scheduledAt).getTime() : Date.now();
     const windowStart = targetTime - windowMs;
-    const memberId = randomUUID();
+    const memberId = options.messageId ?? randomUUID();
 
     // The key must outlive the window it is counting. For a future-dated send
     // that means surviving until targetTime plus one more window, so a task
@@ -214,6 +219,8 @@ export interface ApiRateLimiterOptions {
   windowMs?: number;
   maxBatchSize?: number;
   logger?: Logger;
+  /** Redis key namespace. Distinct limiters must not share one. */
+  keyPrefix?: string;
 }
 
 /**
@@ -242,13 +249,21 @@ export class ApiRateLimiter {
   private readonly windowMs: number;
   private readonly maxBatchSize: number;
   private readonly logger?: Logger;
+  private readonly keyPrefix: string;
   private readonly leases = new Map<string, ProjectTokenLeaseState>();
 
-  constructor({ redis, windowMs = 60_000, maxBatchSize = 500, logger }: ApiRateLimiterOptions) {
+  constructor({
+    redis,
+    windowMs = 60_000,
+    maxBatchSize = 500,
+    logger,
+    keyPrefix = "rate-limit:api:req",
+  }: ApiRateLimiterOptions) {
     this.redis = redis;
     this.windowMs = windowMs;
     this.maxBatchSize = maxBatchSize;
     this.logger = logger;
+    this.keyPrefix = keyPrefix;
   }
 
   /**
@@ -332,7 +347,7 @@ export class ApiRateLimiter {
     }
 
     const prevBucket = bucketIndex - 1;
-    const rlTag = `{rate-limit:api:req:${projectId || "global"}}`;
+    const rlTag = `{${this.keyPrefix}:${projectId || "global"}}`;
     const currentKey = `${rlTag}:${bucketIndex}`;
     const prevKey = `${rlTag}:${prevBucket}`;
     const requested = state.batchSize;

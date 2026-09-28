@@ -246,6 +246,89 @@ describe("BaseWorker Retry and DLQ Logic", () => {
     expect(mockRedis.del).not.toHaveBeenCalled();
   });
 
+  describe("processInline", () => {
+    const inlineEvent = {
+      id: "evt-inline-1",
+      type: "notification.dispatched",
+      timestamp: new Date().toISOString(),
+      metadata: { traceId: "t-1", source: "engine", retryCount: 0 },
+      payload: {},
+    };
+
+    it("runs process without acking anything — there is no stream entry", async () => {
+      const seen: StreamMessage[] = [];
+      class InlineWorker extends BaseWorker {
+        protected async process(message: StreamMessage): Promise<void> {
+          seen.push(message);
+        }
+      }
+      mockConsumer.deadLetter = vi.fn();
+      const worker = new InlineWorker({
+        consumer: mockConsumer,
+        pendingScanner: mockPendingScanner,
+        logger: mockLogger,
+      });
+
+      await worker.processInline(inlineEvent);
+
+      expect(seen[0]!.event).toBe(inlineEvent);
+      expect(mockConsumer.ack).not.toHaveBeenCalled();
+      expect(worker.health().processedCount).toBe(1);
+    });
+
+    it("rethrows retryable errors so the caller's stream entry stays pending", async () => {
+      class FailingWorker extends BaseWorker {
+        protected async process(): Promise<void> {
+          throw new Error("provider down");
+        }
+      }
+      mockConsumer.deadLetter = vi.fn();
+      const worker = new FailingWorker({
+        consumer: mockConsumer,
+        pendingScanner: mockPendingScanner,
+        logger: mockLogger,
+      });
+
+      await expect(worker.processInline(inlineEvent)).rejects.toThrow("provider down");
+      expect(mockConsumer.deadLetter).not.toHaveBeenCalled();
+    });
+
+    it("dead-letters non-retryable errors itself instead of failing the caller", async () => {
+      class PermanentWorker extends BaseWorker {
+        protected async process(): Promise<void> {
+          throw new NonRetryableError("invalid token");
+        }
+      }
+      mockConsumer.deadLetter = vi.fn().mockResolvedValue(undefined);
+      const worker = new PermanentWorker({
+        consumer: mockConsumer,
+        pendingScanner: mockPendingScanner,
+        logger: mockLogger,
+      });
+
+      await expect(worker.processInline(inlineEvent)).resolves.toBeUndefined();
+      expect(mockConsumer.deadLetter).toHaveBeenCalledWith(inlineEvent);
+      expect(mockConsumer.nack).not.toHaveBeenCalled();
+    });
+
+    it("treats a held lock as someone else's work", async () => {
+      class LockedWorker extends BaseWorker {
+        protected async process(): Promise<void> {
+          throw new LockHeldError();
+        }
+      }
+      mockConsumer.deadLetter = vi.fn();
+      const worker = new LockedWorker({
+        consumer: mockConsumer,
+        pendingScanner: mockPendingScanner,
+        logger: mockLogger,
+      });
+
+      await expect(worker.processInline(inlineEvent)).resolves.toBeUndefined();
+      expect(worker.health().errorCount).toBe(0);
+    });
+  });
+
   it("does not ack or nack when process returns { ack: false } (leaving message pending in stream)", async () => {
     class SkipWorker extends BaseWorker {
       protected async process(): Promise<ProcessResult> {
@@ -401,6 +484,17 @@ describe("UserThrottle (Priority-Aware Throttling)", () => {
   const argTargetTime = (call: any[]) => call[5];
   /** Window length the script was actually asked to enforce. */
   const windowMsOf = (call: any[]) => argTargetTime(call) - argWindowStart(call);
+
+  it("counts a message under its own id, so a retry is not counted twice", async () => {
+    const throttle = new UserThrottle({ redis: mockRedis, maxPerHour: 3 });
+    mockRedis.eval.mockResolvedValue(1);
+
+    await throttle.check("proj-1", "usr-1", "normal", { messageId: "evt-1:usr-1:email" });
+    await throttle.check("proj-1", "usr-1", "normal", { messageId: "evt-1:usr-1:email" });
+
+    const members = mockRedis.eval.mock.calls.map((c: any[]) => c[6]);
+    expect(members).toEqual(["evt-1:usr-1:email", "evt-1:usr-1:email"]);
+  });
 
   it("applies a per-project limit override in place of the global default", async () => {
     const throttle = new UserThrottle({ redis: mockRedis, maxPerHour: 3 });
@@ -772,6 +866,42 @@ describe("EnricherWorker", () => {
     expect(publishedArg.payload.channel).toBe("push");
     // Should attach the remaining channels ("sms", "email") to fallbackChain
     expect(publishedArg.payload.fallbackChain).toEqual(["sms", "email"]);
+  });
+
+  it("emits one event per address, naming the contact so the engine need not look it up", async () => {
+    (worker as any).contactRepo.findActiveByUserIds.mockResolvedValue(
+      new Map([
+        [
+          "usr-1",
+          [
+            { id: "c-1", channel: "email", target: "one@example.com" },
+            { id: "c-2", channel: "email", target: "two@example.com" },
+          ],
+        ],
+      ]),
+    );
+
+    await worker.process({
+      id: "msg-2",
+      event: {
+        id: "evt-2",
+        type: "notification.requested",
+        timestamp: new Date().toISOString(),
+        metadata: { traceId: "trace-2", source: "test" },
+        payload: {
+          projectId: "123e4567-e89b-12d3-a456-426614174000",
+          target: { type: "user", userId: "usr-1" },
+          channels: ["email"],
+          templateId: "welcome",
+        },
+      },
+    } as any);
+
+    const events = mockProducers.normal.publishBatch.mock.calls[0][0];
+    expect(events.map((e: any) => [e.payload.contactId, e.payload.destination])).toEqual([
+      ["c-1", "one@example.com"],
+      ["c-2", "two@example.com"],
+    ]);
   });
 
   it("gracefully drops message if resolution target is empty (e.g. segment has 0 users)", async () => {
@@ -1281,14 +1411,99 @@ describe("DeliveryWorker", () => {
     expect(worker["idempotency"].markProcessed).not.toHaveBeenCalled();
   });
 
+  describe("dispatched log entry", () => {
+    const published = () =>
+      (worker as any).eventsProducer.publishBatch.mock.calls.flatMap((c: any[]) => c[0]);
+
+    it("rides on the outcome event when the send is quick: one stream entry, not two", async () => {
+      mockTransportRegistry.getAll.mockReturnValue([
+        { send: vi.fn().mockResolvedValue({ success: true, providerMessageId: "p-1" }) },
+      ]);
+
+      await worker.process(dispatched() as any);
+
+      const events = published();
+      expect(events.map((e: any) => e.type)).toEqual(["notification.delivered"]);
+      expect(events[0].payload.dispatchedAt).toEqual(expect.any(String));
+      expect(events[0].payload.attempt).toBe(1);
+    });
+
+    it("is published on its own once a send has been running for a second", async () => {
+      vi.useFakeTimers();
+      try {
+        let finish: (r: unknown) => void = () => {};
+        mockTransportRegistry.getAll.mockReturnValue([
+          { send: vi.fn(() => new Promise((resolve) => (finish = resolve))) },
+        ]);
+
+        const run = worker.process(dispatched() as any);
+        await vi.advanceTimersByTimeAsync(1_100);
+        expect(published().map((e: any) => e.type)).toEqual(["notification.dispatched"]);
+
+        finish({ success: true, providerMessageId: "p-1" });
+        await vi.runAllTimersAsync();
+        await run;
+
+        const [, outcome] = published();
+        expect(outcome.type).toBe("notification.delivered");
+        expect(outcome.payload.dispatchedAt).toBeUndefined();
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+  });
+
+  describe("rendering at send time", () => {
+    const unrendered = (over: Record<string, unknown> = {}) => {
+      const msg: any = dispatched(over);
+      delete msg.event.payload.renderedContent;
+      return msg;
+    };
+
+    it("renders the task's template before handing it to the transport", async () => {
+      const send = vi.fn().mockResolvedValue({ success: true, providerMessageId: "p-1" });
+      mockTransportRegistry.getAll.mockReturnValue([{ send }]);
+      (worker as any).templateCache = {
+        getCachedTemplate: vi.fn().mockResolvedValue({ content: { subject: "Hi {{name}}" } }),
+      };
+
+      await worker.process(unrendered({ templateId: "tmpl-1", templateVariables: { name: "Al" } }));
+
+      expect(send.mock.calls[0]![0].renderedContent.content.subject).toBe("Hi Al");
+    });
+
+    it("leaves a pre-rendered task (from the AI worker) as it is", async () => {
+      const send = vi.fn().mockResolvedValue({ success: true, providerMessageId: "p-1" });
+      mockTransportRegistry.getAll.mockReturnValue([{ send }]);
+      const getCachedTemplate = vi.fn();
+      (worker as any).templateCache = { getCachedTemplate };
+
+      await worker.process(dispatched({ templateId: "tmpl-1" }) as any);
+
+      expect(getCachedTemplate).not.toHaveBeenCalled();
+      expect(send.mock.calls[0]![0].renderedContent.content.body).toBe("Hello World");
+    });
+
+    it("gives up without sending when the template was deleted since dispatch", async () => {
+      const send = vi.fn();
+      mockTransportRegistry.getAll.mockReturnValue([{ send }]);
+      (worker as any).templateCache = { getCachedTemplate: vi.fn().mockResolvedValue(null) };
+
+      await expect(worker.process(unrendered({ templateId: "gone" }))).rejects.toThrow(
+        NonRetryableError,
+      );
+      expect(send).not.toHaveBeenCalled();
+    });
+  });
+
   describe("provider rate limiting", () => {
     const limitedTransport = (send: any) => ({ send, limits: { limit: 5, windowSeconds: 60 } });
 
     it("reschedules the task instead of sending when the provider limit is hit", async () => {
       const send = vi.fn();
       mockTransportRegistry.getAll.mockReturnValue([limitedTransport(send)]);
-      // [0, oldestScore] — denied, with the window opening 60s after that score.
-      mockRedis.eval = vi.fn().mockResolvedValue([0, Date.now()]);
+      // The lease script grants no tokens: the window's budget is spent.
+      mockRedis.eval = vi.fn().mockResolvedValue(0);
 
       await worker.process(dispatched() as any);
 
@@ -1302,7 +1517,7 @@ describe("DeliveryWorker", () => {
 
     it("counts each throttled attempt so the retries cannot loop forever", async () => {
       mockTransportRegistry.getAll.mockReturnValue([limitedTransport(vi.fn())]);
-      mockRedis.eval = vi.fn().mockResolvedValue([0, Date.now()]);
+      mockRedis.eval = vi.fn().mockResolvedValue(0);
 
       await worker.process(dispatched({ throttleAttemptCount: 2 }) as any);
 
@@ -1312,7 +1527,7 @@ describe("DeliveryWorker", () => {
     it("gives up once the throttled retries exceed maxAttempts", async () => {
       const send = vi.fn();
       mockTransportRegistry.getAll.mockReturnValue([limitedTransport(send)]);
-      mockRedis.eval = vi.fn().mockResolvedValue([0, Date.now()]);
+      mockRedis.eval = vi.fn().mockResolvedValue(0);
 
       await worker.process(
         dispatched({ throttleAttemptCount: 3, deliveryOptions: { maxAttempts: 3 } }) as any,
@@ -1331,7 +1546,7 @@ describe("DeliveryWorker", () => {
 
     it("falls back to another channel instead of dropping an exhausted task", async () => {
       mockTransportRegistry.getAll.mockReturnValue([limitedTransport(vi.fn())]);
-      mockRedis.eval = vi.fn().mockResolvedValue([0, Date.now()]);
+      mockRedis.eval = vi.fn().mockResolvedValue(0);
 
       await worker.process(
         dispatched({
@@ -1349,7 +1564,7 @@ describe("DeliveryWorker", () => {
     it("sends normally when the provider limit has room", async () => {
       const send = vi.fn().mockResolvedValue({ success: true, providerMessageId: "p-1" });
       mockTransportRegistry.getAll.mockReturnValue([limitedTransport(send)]);
-      mockRedis.eval = vi.fn().mockResolvedValue([1, 0]);
+      mockRedis.eval = vi.fn().mockResolvedValue(1);
 
       await worker.process(dispatched() as any);
 
@@ -1785,6 +2000,56 @@ describe("throttleProvider (Provider-Level Rate Limiting)", () => {
   });
 });
 
+import { ProviderThrottle } from "@/services/delivery/throttle.js";
+
+describe("ProviderThrottle (leased provider rate limiting)", () => {
+  it("leases a chunk of the window and spends it without further round trips", async () => {
+    // Mid-window, so the checks cannot straddle a bucket rollover (which
+    // rightly starts a new lease).
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date("2026-01-01T00:00:00.500Z"));
+    try {
+      const redis: any = { leaseApiRateLimit: vi.fn().mockResolvedValue(500) };
+      const throttle = new ProviderThrottle(redis);
+
+      for (let i = 0; i < 50; i++) {
+        const result = await throttle.check("email", { limit: 1_000_000, windowSeconds: 1 });
+        expect(result.allowed).toBe(true);
+      }
+
+      expect(redis.leaseApiRateLimit).toHaveBeenCalledTimes(1);
+      expect(redis.leaseApiRateLimit.mock.calls[0][0]).toMatch(/^\{rate-limit:provider:email\}:/);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("denies with a retry at the end of the current window once the budget is spent", async () => {
+    const redis: any = { leaseApiRateLimit: vi.fn().mockResolvedValue(0) };
+    const logger = { warn: vi.fn() };
+    const throttle = new ProviderThrottle(redis, logger);
+
+    const result = await throttle.check("sms", { limit: 10, windowSeconds: 60 });
+
+    expect(result.allowed).toBe(false);
+    expect(result.retryAfterMs).toBeGreaterThan(0);
+    expect(result.retryAfterMs).toBeLessThanOrEqual(60_000);
+    expect(logger.warn).toHaveBeenCalled();
+  });
+
+  it("keeps channels on separate budgets", async () => {
+    const redis: any = { leaseApiRateLimit: vi.fn().mockResolvedValue(1) };
+    const throttle = new ProviderThrottle(redis);
+
+    await throttle.check("email", { limit: 10, windowSeconds: 60 });
+    await throttle.check("sms", { limit: 10, windowSeconds: 60 });
+
+    const keys = redis.leaseApiRateLimit.mock.calls.map((c: any[]) => c[0]);
+    expect(keys[0]).toContain("provider:email");
+    expect(keys[1]).toContain("provider:sms");
+  });
+});
+
 import { EngineWorker } from "@/services/engine/main.js";
 
 describe("EngineWorker", () => {
@@ -1948,6 +2213,43 @@ describe("EngineWorker", () => {
     expect(mockOutboundProducers.normal.publish).toHaveBeenCalled();
   });
 
+  it("hands due tasks to an in-process delivery instead of the outbound stream when fused", async () => {
+    mockProjectSettingsLoader.mockResolvedValue(null);
+    const inline = vi.fn().mockResolvedValue(undefined);
+    worker.setInlineNext(inline);
+
+    await worker.process(enrichedMsg() as any);
+
+    expect(mockOutboundProducers.normal.publish).not.toHaveBeenCalled();
+    expect(inline).toHaveBeenCalledTimes(1);
+    const handed = inline.mock.calls[0]![0];
+    expect(handed.type).toBe("notification.dispatched");
+    // A full envelope: delivery parses it exactly as if it had come off a stream.
+    expect(typeof handed.id).toBe("string");
+    expect(typeof handed.timestamp).toBe("string");
+  });
+
+  it("skips its own idempotency marker for inline messages, keeping it for stream reads", async () => {
+    mockProjectSettingsLoader.mockResolvedValue(null);
+
+    await worker.process({ ...enrichedMsg("inline-1"), inline: true } as any);
+    expect(mockIdempotency.checkAndMark).not.toHaveBeenCalled();
+    expect(mockIdempotency.markProcessed).not.toHaveBeenCalled();
+    // The throttle still sees a stable id, which is what makes skipping safe.
+    expect(mockThrottle.check.mock.calls[0]![3].messageId).toBeDefined();
+
+    await worker.process(enrichedMsg("stream-1") as any);
+    expect(mockIdempotency.checkAndMark).toHaveBeenCalledTimes(1);
+    expect(mockIdempotency.markProcessed).toHaveBeenCalledTimes(1);
+  });
+
+  it("propagates an inline delivery failure so the enriched message is retried", async () => {
+    mockProjectSettingsLoader.mockResolvedValue(null);
+    worker.setInlineNext(vi.fn().mockRejectedValue(new Error("provider down")));
+
+    await expect(worker.process(enrichedMsg() as any)).rejects.toThrow("provider down");
+  });
+
   it("gracefully drops message if template is nonexistent", async () => {
     // Override safeParsePayload to include templateId
     mockRegistry.safeParsePayload.mockReturnValueOnce({
@@ -2071,28 +2373,9 @@ describe("EngineWorker", () => {
     );
   });
 
-  it("renders template without db using renderTemplate fallback and publishes to outbound", async () => {
-    const msg = {
-      id: "msg-1",
-      event: {
-        id: "evt-1",
-        type: "notification.enriched",
-        metadata: { traceId: "trace-1" },
-        payload: {},
-      },
-    };
-    await worker.process(msg as any);
-    expect(mockOutboundProducers.normal.publish).toHaveBeenCalledTimes(1);
-    const published = mockOutboundProducers.normal.publish.mock.calls[0]![0];
-    expect(published.payload.renderedContent.content.body).toBeDefined();
-  });
-
-  it("renders dbTemplate if available and properly interpolates variables", async () => {
+  it("dispatches unrendered, carrying the template and variables for delivery to render", async () => {
     mockGetCachedTemplate.mockResolvedValue({
-      content: {
-        subject: "Hello {{name}}",
-        text: "Welcome {{name}} to {{project}}",
-      },
+      content: { subject: "Hello {{name}}", text: "Welcome {{name}}" },
     });
     mockRegistry.safeParsePayload.mockReturnValue({
       success: true,
@@ -2108,26 +2391,65 @@ describe("EngineWorker", () => {
           preferences: { optedOut: false, quietHours: [] },
         },
         templateId: "tmpl-1",
-        templateVariables: { name: "Alice", project: "Notifkit" },
+        templateVariables: { name: "Alice" },
         fallbackChain: [],
       },
     });
 
-    const msg = {
+    await worker.process({
       id: "msg-1",
       event: {
         id: "evt-1",
         type: "notification.enriched",
-        metadata: { traceId: "trace-1" },
+        metadata: { traceId: "t" },
         payload: {},
       },
-    };
+    } as any);
 
-    await worker.process(msg as any);
     expect(mockOutboundProducers.normal.publish).toHaveBeenCalledTimes(1);
     const published = mockOutboundProducers.normal.publish.mock.calls[0]![0];
-    expect(published.payload.renderedContent.content.subject).toBe("Hello Alice");
-    expect(published.payload.renderedContent.content.text).toBe("Welcome Alice to Notifkit");
+    expect(published.payload.renderedContent).toBeUndefined();
+    expect(published.payload.templateId).toBe("tmpl-1");
+    expect(published.payload.templateVariables).toEqual({ name: "Alice" });
+  });
+
+  it("sends to the contact the enricher resolved without re-reading the user's contacts", async () => {
+    mockRegistry.safeParsePayload.mockReturnValue({
+      success: true,
+      data: {
+        projectId: "123e4567-e89b-12d3-a456-426614174000",
+        rawEventId: "evt-1",
+        recipientId: "usr-1",
+        channel: "email",
+        priority: "normal",
+        recipient: { locale: "en", timezone: "UTC", preferences: { optedOut: false } },
+        templateVariables: {},
+        contactId: "contact-7",
+        destination: "second@example.com",
+      },
+    });
+    const findActive = (worker as any).contactRepo.findActiveByUserIds;
+    findActive.mockClear();
+
+    await worker.process({
+      id: "msg-1",
+      event: {
+        id: "evt-1",
+        type: "notification.enriched",
+        metadata: { traceId: "t" },
+        payload: {},
+      },
+    } as any);
+
+    expect(findActive).not.toHaveBeenCalled();
+    const published = mockOutboundProducers.normal.publish.mock.calls[0]![0];
+    expect(published.payload.taskId).toBe("evt-1:contact-7");
+    expect(published.payload.destination).toBe("second@example.com");
+    // Two contacts on one channel are two messages, not a duplicate.
+    expect(mockIdempotency.markProcessed).toHaveBeenCalledWith(
+      "evt-1:usr-1:email:contact-7",
+      undefined,
+    );
   });
 
   // ── Suppression gate ──────────────────────────────────────────────────────
@@ -2803,6 +3125,37 @@ describe("EventWorker", () => {
     expect(mockWorkflowProducer.publishBatch).toHaveBeenCalled();
     const published = mockWorkflowProducer.publishBatch.mock.calls[0][0][0];
     expect(published.payload.instanceId).toBe("inst-dot");
+  });
+
+  it("writes both the dispatched and the outcome row from a combined entry", async () => {
+    const values = vi.fn().mockReturnValue({ onConflictDoNothing: vi.fn() });
+    mockDbConn.insert = vi.fn().mockReturnValue({ values });
+
+    const run = worker.process({
+      id: "msg-c",
+      event: {
+        id: "evt-c",
+        type: "notification.delivered",
+        payload: {
+          projectId: "proj-1",
+          taskId: "task-c",
+          channel: "email",
+          providerMessageId: "p-1",
+          attempt: 1,
+          dispatchedAt: "2026-01-01T00:00:00.000Z",
+        },
+      },
+    } as any);
+    await (worker as any).flushLogs();
+    await run;
+
+    const rows = values.mock.calls[0]![0];
+    expect(rows.map((r: any) => [r.kind, r.status])).toEqual([
+      ["dispatched", "dispatched"],
+      ["attempt", "delivered"],
+    ]);
+    expect(rows[0].timestamp).toEqual(new Date("2026-01-01T00:00:00.000Z"));
+    expect(rows[0].providerMessageId).toBeNull();
   });
 
   it("drops oldest log entry when message log buffer is full to apply backpressure", async () => {

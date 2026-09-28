@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { loadEnv, readBaseConfig } from "@/index.js";
 import { createLogger } from "@/index.js";
 import { RedisClient } from "@/index.js";
@@ -16,6 +17,7 @@ import {
   buildStreamEvent,
   type NotificationCreatedPayload,
   type NotificationEnrichedPayload,
+  type StreamEvent,
 } from "@/index.js";
 import { type StreamName } from "@/contracts/streams.js";
 import { IdempotencyGuard } from "@/index.js";
@@ -61,6 +63,8 @@ export class EnricherWorker extends BaseWorker {
   private readonly prefRepo: any;
   private readonly contactRepo: any;
   private readonly templateCache: TemplateCache;
+  /** Engine in this process, when the pipeline is fused. See `setInlineNext`. */
+  private inlineNext: ((event: StreamEvent) => Promise<void>) | null = null;
 
   private userBatch: {
     projectId: string;
@@ -132,6 +136,16 @@ export class EnricherWorker extends BaseWorker {
     this.templateCache = options.templateCache;
 
     this.flushTimer = setInterval(() => void this.flushWorkerBuffers(), 5);
+  }
+
+  /**
+   * Hands enriched events for single-user notifications straight to `next`
+   * instead of the enriched stream. Fan-outs still go through the stream: an
+   * inline chain holds this worker's slot until the last send completes, and a
+   * segment would hold one slot for thousands of them.
+   */
+  setInlineNext(next: ((event: StreamEvent) => Promise<void>) | null): void {
+    this.inlineNext = next;
   }
 
   override async stop(): Promise<void> {
@@ -293,7 +307,7 @@ export class EnricherWorker extends BaseWorker {
             });
           }),
         );
-        this.logger.info(
+        this.logger.debug(
           { messageId: message.id, eventId: event.id, recipientId: raw.recipientId },
           "event enriched",
         );
@@ -376,6 +390,7 @@ export class EnricherWorker extends BaseWorker {
         );
 
       const chunks = chunkArray(userIds, 500);
+      const inline = raw.target.type === "user" ? this.inlineNext : null;
 
       for (const chunk of chunks) {
         const profiles = (
@@ -401,16 +416,17 @@ export class EnricherWorker extends BaseWorker {
             const channelContacts = contacts.filter((contact: any) => contact.channel === channel);
             // Push resolves its active tokens at send time so token invalidation
             // remains current. Other channels need one task per address.
-            const destinations =
-              channel === "push" ? [undefined] : channelContacts.map((c: any) => c.target);
-            if (destinations.length === 0) {
+            const resolved: ({ id: string; target: string } | undefined)[] =
+              channel === "push" ? [undefined] : channelContacts;
+            if (resolved.length === 0) {
               this.logger.info(
                 { recipientId: profile.userId, channel },
                 "no active contact for channel",
               );
               continue;
             }
-            for (const destination of destinations) {
+            for (const contact of resolved) {
+              const destination = contact?.target;
               const enrichedPayload: NotificationEnrichedPayload = {
                 projectId: raw.projectId,
                 rawEventId: event.id,
@@ -444,6 +460,10 @@ export class EnricherWorker extends BaseWorker {
                 },
                 scheduledAt: raw.scheduledAt,
                 fallbackChain: fallbackChain?.length ? fallbackChain : undefined,
+                // Lets the engine send to this contact without reading the
+                // user's contacts a second time.
+                contactId: contact?.id,
+                destination,
                 campaignId: raw.campaignId,
               };
 
@@ -468,6 +488,16 @@ export class EnricherWorker extends BaseWorker {
           if (batchedEvents[p].length > 0) {
             const producer = this.producers[p] ?? this.producers.normal;
             for (const ev of batchedEvents[p]) {
+              if (inline) {
+                publishPromises.push(
+                  inline({
+                    ...ev,
+                    id: randomUUID(),
+                    timestamp: new Date().toISOString(),
+                  } as StreamEvent),
+                );
+                continue;
+              }
               publishPromises.push(
                 new Promise((resolve, reject) => {
                   this.eventBuffer.push({ producer, event: ev, resolve, reject });
@@ -481,7 +511,7 @@ export class EnricherWorker extends BaseWorker {
         }
       }
 
-      this.logger.info(
+      this.logger.debug(
         {
           messageId: message.id,
           eventId: event.id,
@@ -505,10 +535,15 @@ export class EnricherWorker extends BaseWorker {
 
 export async function startEnricherWorker() {
   logger = createLogger({ name: "enricher", level: config.LOG_LEVEL });
-  redis = new RedisClient({ url: config.REDIS_URL, name: "enricher", logger });
+  redis = RedisClient.shared({ url: config.REDIS_URL, name: "enricher", logger });
   const dbData = createDatabase({ url: config.DATABASE_URL, applicationName: "enricher", logger });
   sql = dbData.sql;
   db = dbData.db;
+  // A fused pipeline holds the enricher's slot through engine and delivery, so
+  // it needs delivery's concurrency, not the CPU-bound default.
+  const enricherConcurrency = config.PIPELINE_FUSED
+    ? Math.max(config.WORKER_CONCURRENCY, config.DELIVERY_CONCURRENCY ?? config.WORKER_CONCURRENCY)
+    : config.WORKER_CONCURRENCY;
   const consumerId = `enricher-${process.env.HOSTNAME || process.pid}-${Math.random().toString(36).slice(2, 8)}`;
   consumer = new StreamConsumer({
     redis: redis.native,
@@ -516,8 +551,9 @@ export async function startEnricherWorker() {
     group: CONSUMER_GROUPS.ENRICHER,
     consumer: consumerId,
     dlqStream: STREAMS.DEAD_LETTER,
-    batchSize: config.WORKER_CONCURRENCY,
+    batchSize: enricherConcurrency,
     bufferAcks: true,
+    coalesceMs: 2,
     logger,
   });
 
@@ -564,7 +600,7 @@ export async function startEnricherWorker() {
     pendingScanner,
     logger,
     maxRetriesBeforeDlq: 5,
-    concurrency: config.WORKER_CONCURRENCY,
+    concurrency: enricherConcurrency,
     producers,
     idempotency,
     userRepo,
@@ -579,6 +615,10 @@ export async function startEnricherWorker() {
 
   logger.info({ env: config.NODE_ENV }, "enricher starting");
   await worker.start();
+}
+
+export function getEnricherWorker(): EnricherWorker | undefined {
+  return worker as EnricherWorker | undefined;
 }
 
 // ─── Shutdown ──────────────────────────────────────────────────────────────

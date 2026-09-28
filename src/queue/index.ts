@@ -19,6 +19,12 @@ export interface StreamMessage {
   stream?: string;
   /** Redis Stream PEL delivery count (1 on initial read, >1 on autoclaim/reclaim). */
   deliveryCount?: number;
+  /**
+   * Handed over in-process by an upstream stage (see BaseWorker.processInline)
+   * rather than read from a stream. The upstream stage still holds its own
+   * stream entry and lock for the duration.
+   */
+  inline?: boolean;
 }
 
 export interface PendingEntry {
@@ -230,6 +236,13 @@ export interface StreamConsumerOptions {
   blockMs?: number;
   bufferAcks?: boolean;
   ackFlushMs?: number;
+  /**
+   * After a read that came back short of `batchSize`, wait this long before the
+   * next one. A consumer blocked on an idle stream wakes on every XADD, so under
+   * moderate load it reads a message or two per round trip; a short pause lets a
+   * batch accumulate. Full reads (a backlog) never wait. Default 0.
+   */
+  coalesceMs?: number;
 }
 
 type XReadGroupResult = Array<[string, Array<[string, string[] | null]>]> | null;
@@ -246,6 +259,7 @@ export class StreamConsumer {
   private readonly blockMs: number;
   private readonly bufferAcks: boolean;
   private readonly ackFlushMs: number;
+  private readonly coalesceMs: number;
   private ackBuffers = new Map<string, string[]>();
   private ackTimer: NodeJS.Timeout | null = null;
   private running = false;
@@ -261,9 +275,10 @@ export class StreamConsumer {
     blockMs = 5_000,
     bufferAcks = false,
     ackFlushMs = 5,
+    coalesceMs = 0,
   }: StreamConsumerOptions) {
     this.redis = redis;
-    this.blockingRedis = redis.duplicate();
+    this.blockingRedis = redis.duplicate({ enableAutoPipelining: false });
     this.streams = Array.isArray(stream) ? stream : [stream];
     this.group = group;
     this.consumer = consumer;
@@ -273,6 +288,7 @@ export class StreamConsumer {
     this.blockMs = blockMs;
     this.bufferAcks = bufferAcks;
     this.ackFlushMs = ackFlushMs;
+    this.coalesceMs = coalesceMs;
   }
 
   async ensureGroup(): Promise<void> {
@@ -368,6 +384,9 @@ export class StreamConsumer {
           }
         }
         if (batch.length > 0) yield batch;
+        if (this.coalesceMs > 0 && batch.length < this.batchSize && this.running) {
+          await new Promise((resolve) => setTimeout(resolve, this.coalesceMs));
+        }
       } catch (err) {
         if (
           !this.running &&
@@ -430,6 +449,31 @@ export class StreamConsumer {
     }
     const streams = Array.from(this.ackBuffers.keys());
     await Promise.all(streams.map((s) => this.flushAcksForStream(s)));
+  }
+
+  /**
+   * Writes an event that never had a stream entry of its own (one handed
+   * straight to a worker in-process) to the dead-letter stream, recorded
+   * against this consumer's stream so a replay lands where it would have been
+   * read from.
+   */
+  async deadLetter(event: StreamEvent): Promise<void> {
+    if (!this.dlqStream) {
+      this.logger?.error(
+        { eventId: event.id },
+        "no dead-letter stream configured — dropping event",
+      );
+      return;
+    }
+    await this.redis.xadd(
+      this.dlqStream,
+      "*",
+      "data",
+      JSON.stringify({
+        ...event,
+        dlq: { originalStream: this.streams[0]!, ackedAt: new Date().toISOString() },
+      }),
+    );
   }
 
   async nack(messageId: string, event: StreamEvent, stream?: string): Promise<void> {

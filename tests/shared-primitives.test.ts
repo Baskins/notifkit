@@ -307,6 +307,53 @@ describe("BatchProcessor", () => {
     ]);
   });
 
+  it("runs up to maxConcurrent flushes at once", async () => {
+    let active = 0;
+    let peak = 0;
+    const releases: (() => void)[] = [];
+    const processor = new BatchProcessor<number, number>(
+      1,
+      1_000,
+      async (items) => {
+        active++;
+        peak = Math.max(peak, active);
+        await new Promise<void>((resolve) => releases.push(resolve));
+        active--;
+        return items;
+      },
+      2,
+    );
+
+    const all = Promise.all([processor.add(1), processor.add(2), processor.add(3)]);
+    await sleep(5);
+    // Two batches are on the wire; the third waits for a free slot.
+    expect(active).toBe(2);
+
+    while (releases.length > 0 || active > 0) {
+      releases.shift()?.();
+      await sleep(1);
+    }
+    expect(await all).toEqual([1, 2, 3]);
+    expect(peak).toBe(2);
+  });
+
+  it("flush() drains everything even while every slot is busy", async () => {
+    const processor = new BatchProcessor<number, number>(
+      1,
+      10_000,
+      async (items) => {
+        await sleep(5);
+        return items;
+      },
+      1,
+    );
+
+    const pending = [processor.add(1), processor.add(2), processor.add(3)];
+    await processor.flush();
+
+    expect(await Promise.all(pending)).toEqual([1, 2, 3]);
+  });
+
   it("an explicit flush of an empty buffer is a no-op", async () => {
     const flushFn = vi.fn(async (items: number[]) => items);
     const processor = new BatchProcessor<number, number>(5, 50, flushFn);
@@ -327,6 +374,29 @@ describe("DataLoader", () => {
     expect(batchFn).toHaveBeenCalledTimes(1);
     expect(batchFn.mock.calls[0]![0]).toEqual([1, 2, 3]);
     expect(results).toEqual(["v1", "v2", "v3"]);
+  });
+
+  it("with batchDelayMs, coalesces loads that arrive across ticks", async () => {
+    const batchFn = vi.fn(async (keys: number[]) => keys.map((k) => `v${k}`));
+    const loader = new DataLoader<number, string>(batchFn, { batchDelayMs: 20 });
+
+    const first = loader.load(1);
+    await sleep(2);
+    const second = loader.load(2);
+
+    expect(await Promise.all([first, second])).toEqual(["v1", "v2"]);
+    expect(batchFn).toHaveBeenCalledTimes(1);
+  });
+
+  it("loads as soon as maxBatchSize keys are waiting", async () => {
+    const batchFn = vi.fn(async (keys: number[]) => keys.map((k) => `v${k}`));
+    const loader = new DataLoader<number, string>(batchFn, {
+      batchDelayMs: 10_000,
+      maxBatchSize: 2,
+    });
+
+    // A 10s delay would time the test out if the size trigger did not fire.
+    expect(await Promise.all([loader.load(1), loader.load(2)])).toEqual(["v1", "v2"]);
   });
 
   it("starts a fresh batch on the next tick", async () => {

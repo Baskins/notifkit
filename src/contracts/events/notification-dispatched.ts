@@ -34,7 +34,13 @@ export const NotificationDispatchedPayloadSchema = z.object({
   templateVariables: z.record(z.string(), z.unknown()).default({}),
   aiPrompts: z.record(z.string(), z.string()).optional(),
   recipient: RecipientProfileSchema.optional(),
-  renderedContent: RenderedContentSchema,
+  /**
+   * Absent on tasks the engine dispatches: delivery renders `templateId` with
+   * `templateVariables` just before sending, so the rendered body never rides
+   * through the outbound stream or sits in a scheduled payload. The AI worker
+   * still sends it pre-rendered, since its variables are generated.
+   */
+  renderedContent: RenderedContentSchema.optional(),
   destination: z.string().min(1).optional(),
   deliveryOptions: DeliveryOptionsSchema,
   fallbackChain: z.array(NotificationChannelSchema).optional(),
@@ -42,4 +48,10 @@ export const NotificationDispatchedPayloadSchema = z.object({
   /** Campaign this message belongs to, carried from the originating request. */
   campaignId: z.string().min(1).max(128).optional(),
 });
-export type NotificationDispatchedPayload = z.infer<typeof NotificationDispatchedPayloadSchema>;
+/** A `notification.dispatched` task as it travels on the outbound stream. */
+export type DispatchedTaskPayload = z.infer<typeof NotificationDispatchedPayloadSchema>;
+
+/** A task as a transport receives it: always rendered. */
+export type NotificationDispatchedPayload = DispatchedTaskPayload & {
+  renderedContent: RenderedContent;
+};

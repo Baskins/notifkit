@@ -17,7 +17,8 @@ import {
   registry,
   buildStreamEvent,
   type NotificationEnrichedPayload,
-  type NotificationDispatchedPayload,
+  type DispatchedTaskPayload,
+  type StreamEvent,
 } from "@/index.js";
 import { type StreamName } from "@/contracts/streams.js";
 import { IdempotencyGuard } from "@/index.js";
@@ -34,7 +35,7 @@ import {
   DataLoader,
   LRUCache,
 } from "@/shared/index.js";
-import { renderWithTemplate, TemplateCache } from "@/templates/index.js";
+import { TemplateCache } from "@/templates/index.js";
 import { buildUnsubscribeHeaders } from "@/unsubscribe/index.js";
 import { startHealthReporter } from "@/workers/index.js";
 
@@ -178,6 +179,13 @@ export function isInQuietHours(
   return { inQuietHours: true, nextActiveTime: candidateTime };
 }
 
+/** Idempotency stand-in for inline messages; see EngineWorker.process. */
+const NO_IDEMPOTENCY = {
+  checkAndMark: async (_id: string, _ttl?: number) => true,
+  markProcessed: async (_id: string, _ttl?: number) => {},
+  unmark: async (_id: string) => {},
+};
+
 // ─── Bootstrap ─────────────────────────────────────────────────────────────
 
 loadEnv();
@@ -224,6 +232,8 @@ export class EngineWorker extends BaseWorker {
   private readonly globalEmitter: any;
   private readonly contactRepo: any;
   private readonly db: any;
+  /** Delivery in this process, when the pipeline is fused. */
+  private inlineNext: ((event: StreamEvent) => Promise<void>) | null = null;
 
   constructor(options: EngineWorkerOptions) {
     super(options);
@@ -241,28 +251,36 @@ export class EngineWorker extends BaseWorker {
     this.db = options.db;
   }
 
+  /** Hands due tasks straight to `next` instead of the outbound stream. */
+  setInlineNext(next: ((event: StreamEvent) => Promise<void>) | null): void {
+    this.inlineNext = next;
+  }
+
   private readonly contactsLoader = new DataLoader<
     { projectId: string; recipientId: string },
     any[]
-  >(async (keys) => {
-    const byProject = new Map<string, string[]>();
-    for (const key of keys) {
-      if (!byProject.has(key.projectId)) byProject.set(key.projectId, []);
-      byProject.get(key.projectId)!.push(key.recipientId);
-    }
+  >(
+    async (keys) => {
+      const byProject = new Map<string, string[]>();
+      for (const key of keys) {
+        if (!byProject.has(key.projectId)) byProject.set(key.projectId, []);
+        byProject.get(key.projectId)!.push(key.recipientId);
+      }
 
-    const resultsByProjectAndUser = new Map<string, Map<string, any[]>>();
-    for (const [projectId, userIds] of byProject) {
-      const activeContactsMap = await this.contactRepo.findActiveByUserIds(projectId, userIds);
-      resultsByProjectAndUser.set(projectId, activeContactsMap);
-    }
+      const resultsByProjectAndUser = new Map<string, Map<string, any[]>>();
+      for (const [projectId, userIds] of byProject) {
+        const activeContactsMap = await this.contactRepo.findActiveByUserIds(projectId, userIds);
+        resultsByProjectAndUser.set(projectId, activeContactsMap);
+      }
 
-    return keys.map((key) => {
-      const projectMap = resultsByProjectAndUser.get(key.projectId);
-      if (!projectMap) return [];
-      return projectMap.get(key.recipientId) || [];
-    });
-  });
+      return keys.map((key) => {
+        const projectMap = resultsByProjectAndUser.get(key.projectId);
+        if (!projectMap) return [];
+        return projectMap.get(key.recipientId) || [];
+      });
+    },
+    { batchDelayMs: 2, maxBatchSize: 500 },
+  );
 
   /**
    * Suppressed destinations for one (project, channel), as a normalised set.
@@ -331,7 +349,11 @@ export class EngineWorker extends BaseWorker {
     const enriched = payloadResult.data as NotificationEnrichedPayload;
 
     // Idempotency
-    const idempotencyKey = `${enriched.rawEventId}:${enriched.recipientId}:${enriched.channel}`;
+    // The enricher emits one event per resolved contact, so two addresses on one
+    // channel are two distinct messages here.
+    const idempotencyKey =
+      `${enriched.rawEventId}:${enriched.recipientId}:${enriched.channel}` +
+      (enriched.contactId ? `:${enriched.contactId}` : "");
     let customTtl: number | undefined;
     if (enriched.scheduledAt) {
       const msUntil = new Date(enriched.scheduledAt).getTime() - Date.now();
@@ -341,7 +363,13 @@ export class EngineWorker extends BaseWorker {
       }
     }
 
-    if (!(await this.idempotency.checkAndMark(idempotencyKey, customTtl ?? 60))) {
+    // Inline (fused) runs skip the engine's own marker. They are already
+    // exclusive under the enricher's lock, the send itself is guarded by
+    // delivery's lease on the taskId, and the throttle counts a message once
+    // however often it is retried. Stream-read messages keep the guard.
+    const idempotency = message.inline ? NO_IDEMPOTENCY : this.idempotency;
+
+    if (!(await idempotency.checkAndMark(idempotencyKey, customTtl ?? 60))) {
       this.logger.debug({ messageId: message.id, eventId: event.id }, "duplicate — skipping");
       return;
     }
@@ -359,7 +387,7 @@ export class EngineWorker extends BaseWorker {
           recipientId: enriched.recipientId,
           reason: "user_opted_out",
         });
-        await this.idempotency.markProcessed(idempotencyKey, customTtl);
+        await idempotency.markProcessed(idempotencyKey, customTtl);
         return;
       }
 
@@ -374,7 +402,7 @@ export class EngineWorker extends BaseWorker {
           recipientId: enriched.recipientId,
           reason: "channel_disabled",
         });
-        await this.idempotency.markProcessed(idempotencyKey, customTtl);
+        await idempotency.markProcessed(idempotencyKey, customTtl);
         return;
       }
 
@@ -419,6 +447,8 @@ export class EngineWorker extends BaseWorker {
           limit: projectThrottle.throttleLimit,
           windowHours: projectThrottle.throttleWindowHours,
           scheduledAt: enriched.scheduledAt,
+          // A replayed message must not be counted against the user twice.
+          messageId: idempotencyKey,
         },
       );
       if (!throttleResult.allowed) {
@@ -437,7 +467,7 @@ export class EngineWorker extends BaseWorker {
           enriched.recipientId,
           throttleResult.count,
         );
-        await this.idempotency.markProcessed(idempotencyKey, customTtl);
+        await idempotency.markProcessed(idempotencyKey, customTtl);
         return;
       }
 
@@ -460,7 +490,7 @@ export class EngineWorker extends BaseWorker {
             recipientId: enriched.recipientId,
             reason: "template_not_found",
           });
-          await this.idempotency.markProcessed(idempotencyKey, customTtl);
+          await idempotency.markProcessed(idempotencyKey, customTtl);
           return;
         }
       }
@@ -505,17 +535,29 @@ export class EngineWorker extends BaseWorker {
           },
           "task routed to AI worker",
         );
-        await this.idempotency.markProcessed(idempotencyKey, customTtl);
+        await idempotency.markProcessed(idempotencyKey, customTtl);
         return;
       }
 
-      // Render template
-      const rendered = renderWithTemplate(dbTemplate, enriched.templateVariables);
+      // Rendering happens in delivery, just before the send, so the rendered
+      // body does not travel through the outbound stream.
 
-      const allContacts = await this.contactsLoader.load({
-        projectId: enriched.projectId,
-        recipientId: enriched.recipientId,
-      });
+      // The enricher already resolved the contact; only events without one
+      // (push, channel fallbacks, the AI worker) need the user's contacts.
+      const allContacts =
+        enriched.contactId && enriched.destination
+          ? [
+              {
+                id: enriched.contactId,
+                channel: enriched.channel,
+                target: enriched.destination,
+                active: true,
+              },
+            ]
+          : await this.contactsLoader.load({
+              projectId: enriched.projectId,
+              recipientId: enriched.recipientId,
+            });
       const activeContacts = allContacts.filter(
         (c: any) => c.channel === enriched.channel && c.active,
       );
@@ -531,7 +573,7 @@ export class EngineWorker extends BaseWorker {
           recipientId: enriched.recipientId,
           reason: "no_active_contacts",
         });
-        await this.idempotency.markProcessed(idempotencyKey, customTtl);
+        await idempotency.markProcessed(idempotencyKey, customTtl);
         return;
       }
 
@@ -604,7 +646,7 @@ export class EngineWorker extends BaseWorker {
               })
             : undefined;
 
-        const taskPayload: NotificationDispatchedPayload = {
+        const taskPayload: DispatchedTaskPayload = {
           projectId: enriched.projectId,
           taskId,
           enrichedEventId: event.id,
@@ -615,7 +657,6 @@ export class EngineWorker extends BaseWorker {
           templateVariables: enriched.templateVariables,
           aiPrompts: enriched.aiPrompts,
           recipient: enriched.recipient,
-          renderedContent: rendered,
           destination: resolvedDestination,
           deliveryOptions: {
             maxAttempts: 3,
@@ -662,7 +703,7 @@ export class EngineWorker extends BaseWorker {
           );
 
           await this.scheduledProducer.publish(scheduledEnvelope);
-          this.logger.info(
+          this.logger.debug(
             {
               messageId: message.id,
               taskId,
@@ -675,8 +716,16 @@ export class EngineWorker extends BaseWorker {
           const p = getPriorityBucket(enriched.priority);
           const outboundProducer = this.outboundProducers[p] ?? this.outboundProducers["normal"]!;
 
-          await outboundProducer.publish(envelope);
-          this.logger.info(
+          if (this.inlineNext) {
+            await this.inlineNext({
+              ...envelope,
+              id: randomUUID(),
+              timestamp: new Date().toISOString(),
+            } as StreamEvent);
+          } else {
+            await outboundProducer.publish(envelope);
+          }
+          this.logger.debug(
             {
               messageId: message.id,
               taskId,
@@ -687,9 +736,9 @@ export class EngineWorker extends BaseWorker {
           );
         }
       }
-      await this.idempotency.markProcessed(idempotencyKey, customTtl);
+      await idempotency.markProcessed(idempotencyKey, customTtl);
     } catch (err) {
-      await this.idempotency.unmark(idempotencyKey).catch(() => {});
+      await idempotency.unmark(idempotencyKey).catch(() => {});
       throw err;
     }
   }
@@ -699,7 +748,7 @@ let subscriber: any = null;
 
 export async function startEngineWorker() {
   logger = createLogger({ name: "engine", level: config.LOG_LEVEL });
-  redis = new RedisClient({ url: config.REDIS_URL, name: "engine", logger });
+  redis = RedisClient.shared({ url: config.REDIS_URL, name: "engine", logger });
   const dbData = createDatabase({ url: config.DATABASE_URL, applicationName: "engine", logger });
   sql = dbData.sql;
   db = dbData.db;
@@ -715,6 +764,7 @@ export async function startEngineWorker() {
     dlqStream: STREAMS.DEAD_LETTER,
     batchSize: config.WORKER_CONCURRENCY,
     bufferAcks: true,
+    coalesceMs: 2,
     logger,
   });
 
@@ -796,7 +846,7 @@ export async function startEngineWorker() {
     db,
   });
 
-  subscriber = redis.native.duplicate();
+  subscriber = redis.native.duplicate({ enableAutoPipelining: false });
   await subscriber.subscribe(
     PUBSUB_CHANNELS.TEMPLATE_INVALIDATED,
     PUBSUB_CHANNELS.PROJECT_INVALIDATED,
@@ -817,6 +867,10 @@ export async function startEngineWorker() {
 
   logger.info({ env: config.NODE_ENV }, "engine starting");
   await worker.start();
+}
+
+export function getEngineWorker(): EngineWorker | undefined {
+  return worker as EngineWorker | undefined;
 }
 
 // ─── Shutdown ──────────────────────────────────────────────────────────────

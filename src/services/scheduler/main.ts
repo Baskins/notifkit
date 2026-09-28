@@ -225,7 +225,7 @@ export async function executeSchedulerPoll(
 
 export async function startSchedulerWorker() {
   logger = createLogger({ name: "scheduler", level: config.LOG_LEVEL });
-  redis = new RedisClient({ url: config.REDIS_URL, name: "scheduler", logger });
+  redis = RedisClient.shared({ url: config.REDIS_URL, name: "scheduler", logger });
   const dbData = createDatabase({ url: config.DATABASE_URL, applicationName: "scheduler", logger });
   sql = dbData.sql;
   db = dbData.db;

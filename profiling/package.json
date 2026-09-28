@@ -4,21 +4,18 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "start": "tsx src/server.ts",
+    "start": "node --import tsx src/server.ts",
     "profile:vertical": "tsx tests/vertical.test.ts",
     "profile:horizontal": "tsx tests/horizontal.test.ts",
-    "test:vertical": "tsx tests/vertical.test.ts",
-    "test:horizontal": "tsx tests/horizontal.test.ts",
-    "test": "tsx tests/vertical.test.ts --quick"
+    "test": "tsx tests/vertical.test.ts --quick --tiers=20"
   },
   "dependencies": {
     "@notifkit/provider-console": "file:../packages/provider-console",
-    "notifkit": "file:.."
+    "notifkit": "file:..",
+    "tsx": "^4.19.3"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
-    "testcontainers": "^10.18.0",
-    "tsx": "^4.19.3",
     "typescript": "^5.8.3"
   }
 }

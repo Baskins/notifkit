@@ -4,64 +4,95 @@ export interface BatchItem<T, R> {
   reject: (reason?: any) => void;
 }
 
+/**
+ * Coalesces individual `add()` calls into batched `flushFn` calls.
+ *
+ * A batch goes out when `maxSize` items are waiting or `maxWaitMs` has passed
+ * since the first one arrived. Up to `maxConcurrent` flushes may be in flight
+ * at once: with a single flight, every caller queued behind a slow flush holds
+ * its worker slot for the whole round trip, which caps a worker's throughput at
+ * `maxSize / flushLatency` no matter how much concurrency it was given.
+ */
 export class BatchProcessor<T, R = void> {
   private buffer: BatchItem<T, R>[] = [];
   private timer: NodeJS.Timeout | null = null;
-  private isFlushing = false;
+  private readonly inFlight = new Set<Promise<void>>();
 
   constructor(
     private readonly maxSize: number,
     private readonly maxWaitMs: number,
     private readonly flushFn: (items: T[]) => Promise<R[]>,
+    private readonly maxConcurrent: number = 1,
   ) {}
 
   add(item: T): Promise<R> {
     return new Promise((resolve, reject) => {
       this.buffer.push({ item, resolve, reject });
-      if (this.buffer.length >= this.maxSize && !this.isFlushing) {
-        if (this.timer) {
-          clearTimeout(this.timer);
-          this.timer = null;
-        }
-        void this.flush();
-      } else if (!this.timer && !this.isFlushing) {
-        this.timer = setTimeout(() => {
-          this.timer = null;
-          void this.flush();
-        }, this.maxWaitMs);
+      if (this.buffer.length >= this.maxSize && this.inFlight.size < this.maxConcurrent) {
+        this.clearTimer();
+        void this.flushOnce();
+      } else if (!this.timer && this.inFlight.size < this.maxConcurrent) {
+        this.armTimer();
       }
     });
   }
 
+  /** Flushes everything buffered, waiting for a free flush slot if needed. */
   async flush(): Promise<void> {
-    if (this.isFlushing || this.buffer.length === 0) return;
+    while (this.buffer.length > 0) {
+      while (this.inFlight.size >= this.maxConcurrent) {
+        await Promise.race(this.inFlight);
+      }
+      this.clearTimer();
+      await this.flushOnce();
+    }
+  }
 
-    this.isFlushing = true;
+  private flushOnce(): Promise<void> {
+    if (this.buffer.length === 0 || this.inFlight.size >= this.maxConcurrent) {
+      return Promise.resolve();
+    }
+
     const batch = this.buffer;
     this.buffer = [];
 
-    try {
-      const items = batch.map((b) => b.item);
-      const results = await this.flushFn(items);
-      for (let i = 0; i < batch.length; i++) {
-        batch[i]!.resolve(results[i] as R);
-      }
-    } catch (err) {
-      for (const b of batch) {
-        b.reject(err);
-      }
-    } finally {
-      this.isFlushing = false;
-      if (this.buffer.length > 0 && !this.timer) {
-        if (this.buffer.length >= this.maxSize) {
-          void this.flush();
-        } else {
-          this.timer = setTimeout(() => {
-            this.timer = null;
-            void this.flush();
-          }, this.maxWaitMs);
+    const run = (async () => {
+      try {
+        const results = await this.flushFn(batch.map((b) => b.item));
+        for (let i = 0; i < batch.length; i++) {
+          batch[i]!.resolve(results[i] as R);
+        }
+      } catch (err) {
+        for (const b of batch) {
+          b.reject(err);
         }
       }
+    })();
+
+    this.inFlight.add(run);
+    return run.finally(() => {
+      this.inFlight.delete(run);
+      // Items that arrived while every slot was busy were not given a timer.
+      if (this.buffer.length === 0 || this.timer) return;
+      if (this.buffer.length >= this.maxSize) {
+        void this.flushOnce();
+      } else {
+        this.armTimer();
+      }
+    });
+  }
+
+  private armTimer(): void {
+    this.timer = setTimeout(() => {
+      this.timer = null;
+      void this.flushOnce();
+    }, this.maxWaitMs);
+  }
+
+  private clearTimer(): void {
+    if (this.timer) {
+      clearTimeout(this.timer);
+      this.timer = null;
     }
   }
 }

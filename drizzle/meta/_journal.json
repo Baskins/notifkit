@@ -43,6 +43,13 @@
       "when": 1788781000000,
       "tag": "0005_admin_users",
       "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "7",
+      "when": 1790600000000,
+      "tag": "0006_message_logs_redundant_indexes",
+      "breakpoints": true
     }
   ]
 }

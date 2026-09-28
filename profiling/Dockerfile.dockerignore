@@ -1,0 +1,11 @@
+# Build context is the repo root; ship only what the image copies.
+**/node_modules
+.git
+coverage
+dashboard
+examples
+assets
+badge
+tests
+profiling/results
+profiling/k6

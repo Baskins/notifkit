@@ -211,8 +211,8 @@ export const messageLogs = pgTable(
     timestamp: timestamp("timestamp", { withTimezone: true }).defaultNow().notNull(),
   },
   (table) => ({
-    projectIdx: index("message_logs_project_idx").on(table.projectId),
-    taskIdx: index("task_idx").on(table.taskId),
+    // No standalone project_id or task_id index: the composites below lead
+    // with project_id, and the unique constraint leads with task_id.
     projectIdTaskIdIdx: index("message_logs_project_task_idx").on(table.projectId, table.taskId),
     providerMsgIdx: index("provider_msg_idx").on(table.providerMessageId),
     projectTimeIdx: index("msg_log_proj_time_idx").on(table.projectId, table.timestamp),

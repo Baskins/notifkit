@@ -426,3 +426,29 @@ describe("Redis Pre-compiled Commands (defineCommand)", () => {
     });
   });
 });
+
+describe("RedisClient.shared", () => {
+  it("hands every service the same connection and closes it with the last one", async () => {
+    const close = vi.spyOn(RedisClient.prototype, "disconnect").mockResolvedValue(undefined);
+    const opts = { url: "redis://shared-test:6379", redisOptions: { lazyConnect: true } };
+
+    const a = RedisClient.shared(opts);
+    const b = RedisClient.shared(opts);
+    expect(a.native).toBe(b.native);
+
+    await a.disconnect();
+    await a.disconnect(); // a second release by the same service is a no-op
+    expect(close).not.toHaveBeenCalled();
+
+    await b.disconnect();
+    expect(close).toHaveBeenCalledTimes(1);
+
+    // A service starting after that gets a fresh connection.
+    const c = RedisClient.shared(opts);
+    expect(c.native).not.toBe(a.native);
+    await c.disconnect();
+    close.mockRestore();
+    c.native.disconnect();
+    a.native.disconnect();
+  });
+});

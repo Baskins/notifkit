@@ -292,7 +292,7 @@ export class AiWorker extends BaseWorker {
 
 export async function startAiWorker() {
   logger = createLogger({ name: "ai", level: config.LOG_LEVEL });
-  redis = new RedisClient({ url: config.REDIS_URL, name: "ai", logger });
+  redis = RedisClient.shared({ url: config.REDIS_URL, name: "ai", logger });
   const dbData = createDatabase({ url: config.DATABASE_URL, applicationName: "ai", logger });
   sql = dbData.sql;
   db = dbData.db;
@@ -387,7 +387,7 @@ export async function startAiWorker() {
     db,
   });
 
-  subscriber = redis.native.duplicate();
+  subscriber = redis.native.duplicate({ enableAutoPipelining: false });
   await subscriber.subscribe("template.invalidated");
   subscriber.on("message", (channel: string, message: string) => {
     if (channel === "template.invalidated") {

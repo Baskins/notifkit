@@ -24,6 +24,18 @@ export interface NotifkitOptions {
   autoMigrate?: boolean;
   aiModel?: LanguageModel;
   workerConcurrency?: number;
+  /** In-flight sends per delivery worker. Defaults to `workerConcurrency`. */
+  deliveryConcurrency?: number;
+  /**
+   * When enricher, engine and delivery all run in this process, pass
+   * single-recipient notifications between them in memory rather than through
+   * the enriched and outbound streams: two fewer write/read/ack round trips and
+   * serialisations per message. The inbound stream entry stays pending until
+   * delivery finishes, so a crash replays the chain from the enricher.
+   * Fan-outs, scheduled sends, AI and retries still use the streams.
+   * Also settable with `PIPELINE_FUSED=true`.
+   */
+  fusedPipeline?: boolean;
   redisOptions?: {
     maxQueueLength?: number;
   };
@@ -82,6 +94,10 @@ export class NotifkitServer extends EventEmitter {
       process.env.ADMIN_USERNAME = this.options.adminUser.username;
     if (this.options.workerConcurrency)
       process.env.WORKER_CONCURRENCY = String(this.options.workerConcurrency);
+    if (this.options.fusedPipeline !== undefined)
+      process.env.PIPELINE_FUSED = String(this.options.fusedPipeline);
+    if (this.options.deliveryConcurrency)
+      process.env.DELIVERY_CONCURRENCY = String(this.options.deliveryConcurrency);
     if (this.options.redisOptions?.maxQueueLength)
       process.env.QUEUE_MAX_LEN = String(this.options.redisOptions.maxQueueLength);
     if (this.options.dbOptions?.maxConnections)
@@ -215,6 +231,29 @@ export class NotifkitServer extends EventEmitter {
     }
 
     await Promise.all(startupPromises);
+
+    if (
+      readBaseConfig().PIPELINE_FUSED &&
+      services.includes("enricher") &&
+      services.includes("engine") &&
+      services.includes("delivery")
+    ) {
+      const [{ getEnricherWorker }, { getEngineWorker }, { getDeliveryWorker }] = await Promise.all(
+        [
+          import("./services/enricher/main.js"),
+          import("./services/engine/main.js"),
+          import("./services/delivery/main.js"),
+        ],
+      );
+      const enricher = getEnricherWorker();
+      const engine = getEngineWorker();
+      const delivery = getDeliveryWorker();
+      if (enricher && engine && delivery) {
+        engine.setInlineNext((event) => delivery.processInline(event));
+        enricher.setInlineNext((event) => engine.processInline(event));
+        this.logger.info("pipeline fused: enricher → engine → delivery hand off in-process");
+      }
+    }
   }
 
   async stop() {

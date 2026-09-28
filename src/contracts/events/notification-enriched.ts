@@ -40,6 +40,14 @@ export const NotificationEnrichedPayloadSchema = z.object({
   aiPrompts: z.record(z.string(), z.string()).optional(),
   scheduledAt: z.string().datetime().optional(),
   fallbackChain: z.array(NotificationChannelSchema).optional(),
+  /**
+   * The contact the enricher resolved this message to, and its address. When
+   * present the engine sends to exactly this contact instead of re-reading the
+   * user's contacts. Absent on events from delivery's channel fallback and the
+   * AI worker, which carry a recipient but no resolved contact.
+   */
+  contactId: z.string().min(1).optional(),
+  destination: z.string().min(1).optional(),
   /** Campaign this message belongs to, carried from the originating request. */
   campaignId: z.string().min(1).max(128).optional(),
 });

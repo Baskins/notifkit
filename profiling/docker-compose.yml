@@ -1,3 +1,52 @@
+# Driven by src/runner.ts through the docker compose CLI; every ${VAR} below is
+# set per tier by the runner. Nodes run the image the runner builds as
+# notifkit-prof-node from profiling/Dockerfile.
+
+name: notifkit-prof
+
+x-node-env: &node-env
+  NODE_ENV: production
+  DATABASE_URL: postgres://notifkit:password@db:5432/notifkit
+  REDIS_URL: redis://redis:6379
+  ADMIN_API_KEY: perf-admin-key
+  HOST: 0.0.0.0
+  LOG_LEVEL: ${LOG_LEVEL:-info}
+  WORKER_CONCURRENCY: ${WORKER_CONCURRENCY:-50}
+  DELIVERY_CONCURRENCY: ${DELIVERY_CONCURRENCY:-200}
+  DB_MAX_CONNECTIONS: ${DB_MAX_CONNECTIONS:-5}
+  PIPELINE_FUSED: ${PIPELINE_FUSED:-false}
+  RATE_LIMIT_PER_HOUR: ${RATE_LIMIT_PER_HOUR:-100}
+  # Far above any backlog a run builds: MAXLEN trims unread entries, and a
+  # trimmed notification is simply lost.
+  QUEUE_MAX_LEN: ${QUEUE_MAX_LEN:-5000000}
+  UNSUBSCRIBE_SECRET: profiling-unsubscribe-secret-0123456789
+  PUBLIC_URL: http://localhost:3000
+  PROVIDER_LATENCY_MS: ${PROVIDER_LATENCY_MS:-150-250}
+  PROVIDER_FAILURE_RATE: ${PROVIDER_FAILURE_RATE:-0}
+  # Worker services wait for the runner to open this gate, so ingest can be
+  # measured on its own and the backlog it builds drained as a second phase.
+  WORKER_GATE: "1"
+  # Set by --cpu-prof: V8 profiles land in results/cpuprof on shutdown.
+  NODE_OPTIONS: ${NODE_OPTIONS:-}
+
+x-node: &node
+  image: notifkit-prof-node:latest
+  volumes:
+    - ./results/cpuprof:/prof
+  # Long enough for workers to finish in-flight messages and flush a profile.
+  stop_grace_period: 60s
+  depends_on:
+    db:
+      condition: service_healthy
+    redis:
+      condition: service_healthy
+  healthcheck:
+    test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:3000/health >/dev/null || exit 1"]
+    interval: 2s
+    timeout: 2s
+    retries: 60
+    start_period: 5s
+
 services:
   db:
     image: postgres:15-alpine
@@ -5,8 +54,46 @@ services:
       POSTGRES_DB: notifkit
       POSTGRES_USER: notifkit
       POSTGRES_PASSWORD: password
+    # Production settings scaled to the tier's memory, rather than the image's
+    # defaults (128MB shared_buffers, 1GB max_wal_size) that nobody deploys.
+    command:
+      - postgres
+      - -c
+      - shared_buffers=${PG_SHARED_BUFFERS:-256MB}
+      - -c
+      - effective_cache_size=${PG_EFFECTIVE_CACHE_SIZE:-768MB}
+      - -c
+      - maintenance_work_mem=${PG_MAINTENANCE_WORK_MEM:-64MB}
+      - -c
+      - work_mem=8MB
+      - -c
+      - max_connections=400
+      - -c
+      - wal_buffers=16MB
+      - -c
+      - min_wal_size=512MB
+      - -c
+      - max_wal_size=4GB
+      - -c
+      - checkpoint_completion_target=0.9
+      - -c
+      - random_page_cost=1.1
+      - -c
+      - effective_io_concurrency=200
+      - -c
+      - shared_preload_libraries=pg_stat_statements
+      - -c
+      - pg_stat_statements.track=all
+      - -c
+      - track_io_timing=on
+    shm_size: 512mb
     ports:
       - "35432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U notifkit -d notifkit"]
+      interval: 1s
+      timeout: 2s
+      retries: 60
     deploy:
       resources:
         limits:
@@ -15,257 +102,97 @@ services:
 
   redis:
     image: redis:7-alpine
-    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    # AOF with a once-a-second fsync is the durability production runs with;
+    # the streams are the only copy of a queued notification.
+    command:
+      [
+        "redis-server",
+        "--appendonly",
+        "yes",
+        "--appendfsync",
+        "everysec",
+        "--save",
+        "",
+        "--maxmemory-policy",
+        "noeviction",
+      ]
     ports:
       - "36379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 1s
+      timeout: 2s
+      retries: 60
     deploy:
       resources:
         limits:
           cpus: "${REDIS_CPUS:-1.0}"
           memory: "${REDIS_MEMORY:-1G}"
 
-  # ── Vertical Scaling: Single Server Monolith ──────────────────────────────────
-
+  # ── Vertical: one monolith running every service ──────────────────────────
   server:
-    build:
-      context: ..
-      dockerfile: profiling/Dockerfile
+    <<: *node
     environment:
-      DATABASE_URL: postgres://notifkit:password@db:5432/notifkit
-      REDIS_URL: redis://redis:6379
-      ADMIN_API_KEY: perf-admin-key
-      LOG_LEVEL: warn
-      HOST: 0.0.0.0
-      WORKER_CONCURRENCY: ${WORKER_CONCURRENCY:-50}
-      DB_MAX_CONNECTIONS: ${DB_MAX_CONNECTIONS:-10}
-      PROVIDER_LATENCY_MS: ${PROVIDER_LATENCY_MS:-0}
-      RATE_LIMIT_PER_HOUR: ${RATE_LIMIT_PER_HOUR:-10000000}
-      SERVICES: ${SERVER_SERVICES:-all}
+      <<: *node-env
+      SERVICES: ${SERVER_SERVICES:-api,enricher,engine,delivery,scheduler,events}
     ports:
       - "35678:3000"
-    depends_on:
-      - db
-      - redis
     deploy:
       resources:
         limits:
           cpus: "${SERVER_CPUS:-1.0}"
           memory: "${SERVER_MEMORY:-1G}"
 
-  # ── Horizontal Scaling: Distributed Service Nodes ────────────────────────────
-
-  # $20 Baseline: 1 Monolith Server
-  monolith-server:
-    build:
-      context: ..
-      dockerfile: profiling/Dockerfile
+  # ── Horizontal: API ingress nodes ─────────────────────────────────────────
+  api-1:
+    <<: *node
     environment:
-      DATABASE_URL: postgres://notifkit:password@db:5432/notifkit
-      REDIS_URL: redis://redis:6379
-      ADMIN_API_KEY: perf-admin-key
-      LOG_LEVEL: warn
-      HOST: 0.0.0.0
-      WORKER_CONCURRENCY: ${WORKER_CONCURRENCY:-50}
-      DB_MAX_CONNECTIONS: ${DB_MAX_CONNECTIONS:-5}
-      PROVIDER_LATENCY_MS: ${PROVIDER_LATENCY_MS:-0}
-      RATE_LIMIT_PER_HOUR: ${RATE_LIMIT_PER_HOUR:-10000000}
-      SERVICES: ${MONOLITH_SERVICES:-api,enricher,engine,delivery,scheduler}
+      <<: *node-env
+      SERVICES: api
     ports:
       - "35678:3000"
-    depends_on:
-      - db
-      - redis
     deploy:
       resources:
         limits:
-          cpus: "${SERVER_CPUS:-1.0}"
-          memory: "${SERVER_MEMORY:-1G}"
+          cpus: "${API_CPUS:-1.0}"
+          memory: "${API_MEMORY:-1G}"
 
-  # API Ingress Node 1
-  api-server-1:
-    build:
-      context: ..
-      dockerfile: profiling/Dockerfile
+  api-2:
+    <<: *node
     environment:
-      DATABASE_URL: postgres://notifkit:password@db:5432/notifkit
-      REDIS_URL: redis://redis:6379
-      ADMIN_API_KEY: perf-admin-key
-      LOG_LEVEL: warn
-      HOST: 0.0.0.0
-      WORKER_CONCURRENCY: ${WORKER_CONCURRENCY:-100}
-      DB_MAX_CONNECTIONS: ${DB_MAX_CONNECTIONS:-5}
-      PROVIDER_LATENCY_MS: ${PROVIDER_LATENCY_MS:-0}
-      RATE_LIMIT_PER_HOUR: ${RATE_LIMIT_PER_HOUR:-10000000}
-      SERVICES: ${API_1_SERVICES:-api}
-    ports:
-      - "35678:3000"
-    depends_on:
-      - db
-      - redis
+      <<: *node-env
+      SERVICES: api
     deploy:
       resources:
         limits:
-          cpus: "${SERVER_CPUS:-1.0}"
-          memory: "${SERVER_MEMORY:-1G}"
+          cpus: "${API_CPUS:-1.0}"
+          memory: "${API_MEMORY:-1G}"
 
-  # API Ingress Node 2
-  api-server-2:
-    build:
-      context: ..
-      dockerfile: profiling/Dockerfile
+  # ── Horizontal: identical pipeline workers, scaled by count ───────────────
+  worker-1: &worker
+    <<: *node
     environment:
-      DATABASE_URL: postgres://notifkit:password@db:5432/notifkit
-      REDIS_URL: redis://redis:6379
-      ADMIN_API_KEY: perf-admin-key
-      LOG_LEVEL: warn
-      HOST: 0.0.0.0
-      WORKER_CONCURRENCY: ${WORKER_CONCURRENCY:-100}
-      DB_MAX_CONNECTIONS: ${DB_MAX_CONNECTIONS:-5}
-      PROVIDER_LATENCY_MS: ${PROVIDER_LATENCY_MS:-0}
-      RATE_LIMIT_PER_HOUR: ${RATE_LIMIT_PER_HOUR:-10000000}
-      SERVICES: ${API_2_SERVICES:-api}
-    ports:
-      - "35679:3000"
-    depends_on:
-      - db
-      - redis
+      <<: *node-env
+      SERVICES: ${WORKER_SERVICES:-enricher,engine,delivery,scheduler,events}
     deploy:
       resources:
         limits:
-          cpus: "${SERVER_CPUS:-1.0}"
-          memory: "${SERVER_MEMORY:-1G}"
+          cpus: "${WORKER_CPUS:-1.0}"
+          memory: "${WORKER_MEMORY:-1G}"
 
-  # Consolidated Worker Node ($40 tier)
-  worker-server:
-    build:
-      context: ..
-      dockerfile: profiling/Dockerfile
-    environment:
-      DATABASE_URL: postgres://notifkit:password@db:5432/notifkit
-      REDIS_URL: redis://redis:6379
-      ADMIN_API_KEY: perf-admin-key
-      LOG_LEVEL: warn
-      HOST: 0.0.0.0
-      WORKER_CONCURRENCY: ${WORKER_CONCURRENCY:-100}
-      DB_MAX_CONNECTIONS: ${DB_MAX_CONNECTIONS:-8}
-      PROVIDER_LATENCY_MS: ${PROVIDER_LATENCY_MS:-0}
-      RATE_LIMIT_PER_HOUR: ${RATE_LIMIT_PER_HOUR:-10000000}
-      SERVICES: ${WORKER_SERVICES:-enricher,engine,delivery,scheduler}
-    ports:
-      - "35680:3000"
-    depends_on:
-      - db
-      - redis
-    deploy:
-      resources:
-        limits:
-          cpus: "${SERVER_CPUS:-1.0}"
-          memory: "${SERVER_MEMORY:-1G}"
+  worker-2: *worker
+  worker-3: *worker
+  worker-4: *worker
 
-  # Pipeline Worker Node ($60 tier)
-  pipeline-worker:
-    build:
-      context: ..
-      dockerfile: profiling/Dockerfile
-    environment:
-      DATABASE_URL: postgres://notifkit:password@db:5432/notifkit
-      REDIS_URL: redis://redis:6379
-      ADMIN_API_KEY: perf-admin-key
-      LOG_LEVEL: warn
-      HOST: 0.0.0.0
-      WORKER_CONCURRENCY: ${WORKER_CONCURRENCY:-100}
-      DB_MAX_CONNECTIONS: ${DB_MAX_CONNECTIONS:-8}
-      PROVIDER_LATENCY_MS: ${PROVIDER_LATENCY_MS:-0}
-      RATE_LIMIT_PER_HOUR: ${RATE_LIMIT_PER_HOUR:-10000000}
-      SERVICES: ${PIPELINE_SERVICES:-enricher,engine,scheduler}
-    ports:
-      - "35681:3000"
-    depends_on:
-      - db
-      - redis
+  # ── Load generator, inside the compose network ────────────────────────────
+  loadgen:
+    image: grafana/k6:1.0.0
+    volumes:
+      - ./k6:/scripts:ro
+      - ./results/.k6:/out
+    command: ["run", "--quiet", "--no-usage-report", "/scripts/notify.js"]
     deploy:
       resources:
         limits:
-          cpus: "${SERVER_CPUS:-1.0}"
-          memory: "${SERVER_MEMORY:-1G}"
-
-  # Delivery Worker Node ($60-$100 tiers)
-  delivery-worker:
-    build:
-      context: ..
-      dockerfile: profiling/Dockerfile
-    environment:
-      DATABASE_URL: postgres://notifkit:password@db:5432/notifkit
-      REDIS_URL: redis://redis:6379
-      ADMIN_API_KEY: perf-admin-key
-      LOG_LEVEL: warn
-      HOST: 0.0.0.0
-      WORKER_CONCURRENCY: ${WORKER_CONCURRENCY:-100}
-      DB_MAX_CONNECTIONS: ${DB_MAX_CONNECTIONS:-8}
-      PROVIDER_LATENCY_MS: ${PROVIDER_LATENCY_MS:-0}
-      RATE_LIMIT_PER_HOUR: ${RATE_LIMIT_PER_HOUR:-10000000}
-      SERVICES: ${DELIVERY_SERVICES:-delivery}
-    ports:
-      - "35682:3000"
-    depends_on:
-      - db
-      - redis
-    deploy:
-      resources:
-        limits:
-          cpus: "${SERVER_CPUS:-1.0}"
-          memory: "${SERVER_MEMORY:-1G}"
-
-  # Enricher Worker Node ($80-$100 tiers)
-  enricher-worker:
-    build:
-      context: ..
-      dockerfile: profiling/Dockerfile
-    environment:
-      DATABASE_URL: postgres://notifkit:password@db:5432/notifkit
-      REDIS_URL: redis://redis:6379
-      ADMIN_API_KEY: perf-admin-key
-      LOG_LEVEL: warn
-      HOST: 0.0.0.0
-      WORKER_CONCURRENCY: ${WORKER_CONCURRENCY:-100}
-      DB_MAX_CONNECTIONS: ${DB_MAX_CONNECTIONS:-8}
-      PROVIDER_LATENCY_MS: ${PROVIDER_LATENCY_MS:-0}
-      RATE_LIMIT_PER_HOUR: ${RATE_LIMIT_PER_HOUR:-10000000}
-      SERVICES: ${ENRICHER_SERVICES:-enricher,scheduler}
-    ports:
-      - "35683:3000"
-    depends_on:
-      - db
-      - redis
-    deploy:
-      resources:
-        limits:
-          cpus: "${SERVER_CPUS:-1.0}"
-          memory: "${SERVER_MEMORY:-1G}"
-
-  # Engine Worker Node ($80-$100 tiers)
-  engine-worker:
-    build:
-      context: ..
-      dockerfile: profiling/Dockerfile
-    environment:
-      DATABASE_URL: postgres://notifkit:password@db:5432/notifkit
-      REDIS_URL: redis://redis:6379
-      ADMIN_API_KEY: perf-admin-key
-      LOG_LEVEL: warn
-      HOST: 0.0.0.0
-      WORKER_CONCURRENCY: ${WORKER_CONCURRENCY:-100}
-      DB_MAX_CONNECTIONS: ${DB_MAX_CONNECTIONS:-8}
-      PROVIDER_LATENCY_MS: ${PROVIDER_LATENCY_MS:-0}
-      RATE_LIMIT_PER_HOUR: ${RATE_LIMIT_PER_HOUR:-10000000}
-      SERVICES: ${ENGINE_SERVICES:-engine}
-    ports:
-      - "35684:3000"
-    depends_on:
-      - db
-      - redis
-    deploy:
-      resources:
-        limits:
-          cpus: "${SERVER_CPUS:-1.0}"
-          memory: "${SERVER_MEMORY:-1G}"
+          cpus: "${LOADGEN_CPUS:-4.0}"
+          memory: "2G"

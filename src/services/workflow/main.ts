@@ -469,7 +469,7 @@ export function __injectForTests(r: any, d: any, wp: any, np: any) {
 
 export async function startWorkflowWorker() {
   logger = createLogger({ name: "workflow-worker", level: config.LOG_LEVEL });
-  redis = new RedisClient({ url: config.REDIS_URL, name: "workflow", logger });
+  redis = RedisClient.shared({ url: config.REDIS_URL, name: "workflow", logger });
   const dbData = createDatabase({ url: config.DATABASE_URL, applicationName: "workflow", logger });
   sql = dbData.sql;
   db = dbData.db;

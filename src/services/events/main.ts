@@ -11,7 +11,8 @@ import { BaseWorker } from "@/index.js";
 import { STREAMS, CONSUMER_GROUPS, buildStreamEvent } from "@/index.js";
 import { type StreamName } from "@/contracts/streams.js";
 import { createDatabase } from "@/db/index.js";
-import { workflowWaiters, workflowSteps, workflowInstances, messageLogs } from "@/db/schema.js";
+import { insertMessageLogs } from "@/db/bulk.js";
+import { workflowWaiters, workflowSteps, workflowInstances } from "@/db/schema.js";
 import { eq, and, or, isNull, gt } from "drizzle-orm";
 import { type WorkerOptions } from "@/shared/index.js";
 import { startHealthReporter } from "@/workers/index.js";
@@ -46,12 +47,23 @@ export class EventWorker extends BaseWorker {
     reject: (err: any) => void;
   }[] = [];
   private flushInterval: NodeJS.Timeout | null = null;
-  private isFlushing = false;
+  private flushesInFlight = 0;
+  private static readonly MAX_CONCURRENT_FLUSHES = 4;
+  /**
+   * Buffered logs that trigger a flush without waiting for the interval.
+   *
+   * Every message holds its worker slot until its log row is written, so a
+   * purely timed flush caps the worker at `concurrency / LOG_FLUSH_INTERVAL_MS`
+   * rows per second — far below what one delivery worker produces. Flushing
+   * once half the slots are waiting keeps the other half reading.
+   */
+  private readonly flushThreshold: number;
 
   constructor(options: EventWorkerOptions) {
     super(options);
     this.dbConn = options.db;
     this.workflowProducer = options.workflowProducer;
+    this.flushThreshold = Math.max(1, Math.min(500, Math.floor(this.concurrency / 2)));
     this.startFlushInterval();
   }
 
@@ -62,9 +74,12 @@ export class EventWorker extends BaseWorker {
   }
 
   private async flushLogs() {
-    if (this.isFlushing || (this.messageLogBuffer.length === 0 && this.eventBuffer.length === 0))
+    if (
+      this.flushesInFlight >= EventWorker.MAX_CONCURRENT_FLUSHES ||
+      (this.messageLogBuffer.length === 0 && this.eventBuffer.length === 0)
+    )
       return;
-    this.isFlushing = true;
+    this.flushesInFlight++;
 
     const startTime = Date.now();
     const batch = this.messageLogBuffer;
@@ -75,13 +90,13 @@ export class EventWorker extends BaseWorker {
 
     try {
       if (batch.length > 0) {
-        await this.dbConn
-          .insert(messageLogs)
-          .values(batch.map((b) => b.log))
-          .onConflictDoNothing(); // Idempotent insert
+        await insertMessageLogs(
+          this.dbConn,
+          batch.map((b) => b.log),
+        ); // Idempotent insert
         for (const b of batch) b.resolve();
 
-        this.logger.info(
+        this.logger.debug(
           {
             batchSize: batch.length,
             latencyMs: Date.now() - startTime,
@@ -112,14 +127,31 @@ export class EventWorker extends BaseWorker {
       for (const b of batch) b.reject(error);
       for (const e of events) e.reject(error);
     } finally {
-      this.isFlushing = false;
+      this.flushesInFlight--;
+      // Rows that arrived while every flush slot was busy would otherwise wait
+      // out the interval with their worker slots held.
+      if (this.messageLogBuffer.length >= this.flushThreshold) {
+        void this.flushLogs();
+      }
     }
   }
 
   override async stop(): Promise<void> {
-    if (this.flushInterval) clearInterval(this.flushInterval);
+    // The interval keeps running until in-flight messages settle: each of them
+    // is waiting on a flush, and clearing it first left them to the 30s stop
+    // timeout.
     await super.stop();
-    await this.flushLogs();
+    if (this.flushInterval) clearInterval(this.flushInterval);
+    const deadline = Date.now() + 10_000;
+    while (
+      (this.messageLogBuffer.length > 0 ||
+        this.eventBuffer.length > 0 ||
+        this.flushesInFlight > 0) &&
+      Date.now() < deadline
+    ) {
+      await this.flushLogs();
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
   }
 
   override async process(message: StreamMessage): Promise<void> {
@@ -150,26 +182,42 @@ export class EventWorker extends BaseWorker {
 
       const kind = event.type === "notification.dispatched" ? "dispatched" : "attempt";
 
-      publishPromises.push(
-        new Promise((resolve, reject) => {
+      const row = (
+        rowKind: string,
+        rowStatus: string,
+        providerMessageId: string | null,
+        timestamp?: string,
+      ) =>
+        new Promise<void>((resolve, reject) => {
           this.messageLogBuffer.push({
             log: {
               projectId: payload.projectId,
               taskId: payload.taskId,
-              providerMessageId: payload.providerMessageId || null,
+              providerMessageId,
               channel: payload.channel,
               attempt: payload.attempt || 1,
-              kind,
-              status,
+              kind: rowKind,
+              status: rowStatus,
               templateId: payload.templateId || null,
               workflowInstanceId: payload.workflowInstanceId || null,
               campaignId: payload.campaignId || null,
+              timestamp,
             },
             resolve,
             reject,
           });
-        }),
-      );
+        });
+
+      // An outcome carrying `dispatchedAt` also stands in for the attempt's
+      // dispatched entry, which delivery folded into it. Stamped with the
+      // dispatch time so the log still reads dispatched → outcome.
+      if (kind === "attempt" && payload.dispatchedAt) {
+        publishPromises.push(row("dispatched", "dispatched", null, payload.dispatchedAt));
+      }
+      publishPromises.push(row(kind, status, payload.providerMessageId || null));
+      if (this.messageLogBuffer.length >= this.flushThreshold) {
+        void this.flushLogs();
+      }
       await Promise.all(publishPromises);
       return;
     }
@@ -313,7 +361,7 @@ export class EventWorker extends BaseWorker {
 
 export async function startEventWorker() {
   logger = createLogger({ name: "event-worker", level: config.LOG_LEVEL });
-  redis = new RedisClient({ url: config.REDIS_URL, name: "events", logger });
+  redis = RedisClient.shared({ url: config.REDIS_URL, name: "events", logger });
   const dbData = createDatabase({ url: config.DATABASE_URL, applicationName: "events", logger });
   sql = dbData.sql;
   db = dbData.db;
@@ -322,13 +370,22 @@ export async function startEventWorker() {
     stream: STREAMS.WORKFLOW_INBOUND,
     logger,
   });
+  // Delivery emits two events per message, so this worker has to keep at least
+  // as many in flight as delivery does or its stream grows without bound.
+  const eventsConcurrency = Math.max(
+    config.WORKER_CONCURRENCY,
+    config.DELIVERY_CONCURRENCY ?? config.WORKER_CONCURRENCY,
+  );
   consumer = new StreamConsumer({
     redis: redis.native,
     stream: STREAMS.EVENTS_INBOUND as StreamName,
     group: CONSUMER_GROUPS.EVENTS as any,
     consumer: `events-${process.pid}`,
     dlqStream: STREAMS.DEAD_LETTER,
-    batchSize: config.WORKER_CONCURRENCY,
+    batchSize: eventsConcurrency,
+    bufferAcks: true,
+    // Log rows are not latency-sensitive; let reads fill up.
+    coalesceMs: 10,
     logger,
   });
 
@@ -344,7 +401,7 @@ export async function startEventWorker() {
     consumer,
     pendingScanner,
     logger,
-    concurrency: config.WORKER_CONCURRENCY,
+    concurrency: eventsConcurrency,
     db,
     workflowProducer,
   });
