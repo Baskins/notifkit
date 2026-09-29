@@ -221,6 +221,21 @@ describe("executeSchedulerPoll", () => {
       expect(batch[0].metadata.traceId).toBe("trace-abc");
     });
 
+    it("releases a task once when a rebuild left a second copy in the same poll", async () => {
+      // The rebuilt member has no trace id, so it is a different ZSET member.
+      const rebuilt = JSON.stringify({ taskId: "task-3", enrichedEventId: "evt-1" });
+      const h = harness({ shards: shardReplies({ 3: [task("task-3"), rebuilt] }) });
+      h.mockDb.queueSelect([{ taskId: "task-3", payload: { priority: "normal" } }]);
+
+      await run(h);
+
+      expect(h.producers.normal.publishBatch).toHaveBeenCalledTimes(1);
+      expect(h.producers.normal.publishBatch.mock.calls[0]![0]).toHaveLength(1);
+      // Both copies leave the ZSET, or the second would be claimed again later.
+      expect(h.cleanupPipeline.zrem).toHaveBeenCalledWith("notif:scheduled:zset:3", task("task-3"));
+      expect(h.cleanupPipeline.zrem).toHaveBeenCalledWith("notif:scheduled:zset:3", rebuilt);
+    });
+
     it("routes by the payload's priority", async () => {
       const h = harness({ shards: shardReplies({ 0: [task("task-a"), task("task-b")] }) });
       h.mockDb.queueSelect([

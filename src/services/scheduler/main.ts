@@ -13,7 +13,7 @@ import {
 } from "@/index.js";
 import { getPriorityBucket, type WorkerOptions } from "@/shared/index.js";
 import { scheduledPayloads } from "@/db/schema.js";
-import { inArray } from "drizzle-orm";
+import { asc, gt, inArray } from "drizzle-orm";
 import { startHealthReporter } from "@/workers/index.js";
 import {
   createPriorityProducers,
@@ -146,8 +146,20 @@ export async function executeSchedulerPoll(
     const cleanupPipeline = redis.pipeline();
     const dbCleanupIds: string[] = [];
 
+    // After a rebuild the same task can sit in the ZSET twice (the original
+    // member carries a trace id Postgres does not keep), so release each task
+    // once and just clear any second copy.
+    const released = new Set<string>();
+
     for (let i = 0; i < parsedTasks.length; i++) {
       const { taskStr, taskId, traceId } = parsedTasks[i];
+      if (released.has(taskId)) {
+        cleanupPipeline.zrem(
+          `notif:scheduled:zset:${parseInt(taskId.slice(-1), 16) || 0}`,
+          taskStr,
+        );
+        continue;
+      }
       const payload = payloadMap.get(taskId);
 
       if (!payload) {
@@ -164,6 +176,7 @@ export async function executeSchedulerPoll(
         buildStreamEvent("notification.dispatched", dispatchPayload, "scheduler", traceId),
       );
 
+      released.add(taskId);
       dbCleanupIds.push(taskId);
       const shard = parseInt(taskId.slice(-1), 16) || 0;
       cleanupPipeline.zrem(`notif:scheduled:zset:${shard}`, taskStr);
@@ -207,6 +220,63 @@ export async function executeSchedulerPoll(
   }
 }
 
+/**
+ * Present while the scheduler ZSETs are known to be intact. Redis losing its
+ * data (a flush, a restart without persistence, failover to an empty replica)
+ * takes this key with it, which is how the poll loop notices.
+ */
+export const SCHEDULER_SENTINEL_KEY = "notif:scheduler:intact";
+
+/**
+ * Re-queues every scheduled send still waiting in Postgres. Each row keeps its
+ * payload, and with it the send time, so the ZSETs can be rebuilt exactly;
+ * a legacy row without a send time is released on the next poll.
+ *
+ * Only run when the sentinel is missing: a rebuilt member has no trace id and
+ * so never matches a surviving original, and the poll only de-duplicates
+ * copies that happen to be claimed together.
+ */
+export async function rebuildScheduledQueue(
+  redis: Redis,
+  db: any,
+  logger: Logger,
+  pageSize = 1000,
+): Promise<number> {
+  let after: string | undefined;
+  let total = 0;
+  for (;;) {
+    const rows: { taskId: string; payload: any }[] = await db
+      .select({ taskId: scheduledPayloads.taskId, payload: scheduledPayloads.payload })
+      .from(scheduledPayloads)
+      .where(after === undefined ? undefined : gt(scheduledPayloads.taskId, after))
+      .orderBy(asc(scheduledPayloads.taskId))
+      .limit(pageSize);
+    if (rows.length === 0) break;
+
+    const pipeline = redis.pipeline();
+    for (const { taskId, payload } of rows) {
+      const sendAt = Date.parse(payload?.scheduledAt ?? "");
+      const member = JSON.stringify({ taskId, enrichedEventId: payload?.enrichedEventId });
+      const shard = parseInt(taskId.slice(-1), 16) || 0;
+      pipeline.zadd(
+        `notif:scheduled:zset:${shard}`,
+        "NX",
+        Number.isNaN(sendAt) ? Date.now() : sendAt,
+        member,
+      );
+    }
+    await pipeline.exec();
+
+    total += rows.length;
+    after = rows[rows.length - 1]!.taskId;
+    if (rows.length < pageSize) break;
+  }
+  // Last, so a crash part-way leaves the sentinel missing and the next poll retries.
+  await redis.set(SCHEDULER_SENTINEL_KEY, "1");
+  if (total > 0) logger.warn({ count: total }, "rebuilt scheduled queue from Postgres");
+  return total;
+}
+
 export async function startSchedulerWorker() {
   ({ logger, redis, sql, db } = createWorkerRuntime(config, "scheduler"));
   ({ consumer, pendingScanner } = createStreamConsumer(
@@ -240,6 +310,9 @@ export async function startSchedulerWorker() {
   const pollLoop = async (): Promise<void> => {
     if (!isPolling) return;
     try {
+      if (!(await redis.native.exists(SCHEDULER_SENTINEL_KEY))) {
+        await rebuildScheduledQueue(redis.native, db, logger);
+      }
       const hasMore = await executeSchedulerPoll(redis.native, outboundProducers, logger, db);
       if (isPolling) {
         pollTimeout = setTimeout(() => void pollLoop(), hasMore ? 0 : 5000);

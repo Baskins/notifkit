@@ -352,11 +352,14 @@ export class DeliveryWorker extends BaseWorker {
           return;
         }
 
+        // The retry time rides in the payload so the scheduler can re-queue
+        // this from Postgres if Redis loses its data.
+        const retryAt = new Date(Date.now() + retryAfterMs).toISOString();
         await this.db
           .insert(scheduledPayloads)
           .values({
             taskId: task.taskId,
-            payload: task,
+            payload: { ...task, scheduledAt: retryAt },
           })
           .onConflictDoUpdate({
             target: scheduledPayloads.taskId,
@@ -370,7 +373,7 @@ export class DeliveryWorker extends BaseWorker {
               projectId: task.projectId,
               enrichedEventId: task.enrichedEventId,
               taskId: task.taskId,
-              scheduledAt: new Date(Date.now() + retryAfterMs).toISOString(),
+              scheduledAt: retryAt,
               throttleAttemptCount: task.throttleAttemptCount,
             },
             "delivery",

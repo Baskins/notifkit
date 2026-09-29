@@ -232,7 +232,9 @@ export class AiWorker extends BaseWorker {
       if (scheduledAt > now) {
         await this.db.insert(scheduledPayloads).values({
           taskId,
-          payload: taskPayload,
+          // The send time rides in the payload so the scheduler can re-queue
+          // this from Postgres if Redis loses its data.
+          payload: { ...taskPayload, scheduledAt: pending.scheduledAt },
         });
 
         const scheduledEnvelope = buildStreamEvent(

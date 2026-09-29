@@ -196,6 +196,7 @@ export class UserThrottle {
       targetTime,
       memberId,
       ttlSeconds,
+      Date.now() - windowMs,
     );
 
     return { allowed: count <= limit, count, limit };

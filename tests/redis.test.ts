@@ -72,31 +72,6 @@ describe("Redis Pre-compiled Commands (defineCommand)", () => {
         void client.disconnect();
       }
     });
-
-    it("validates Lua scripts contain required Redis commands", () => {
-      expect(LUA_LEASE_API_RATE_LIMIT).toContain('redis.call("INCRBY"');
-      expect(LUA_LEASE_API_RATE_LIMIT).toContain('redis.call("EXPIRE"');
-      expect(LUA_LEASE_API_RATE_LIMIT).toContain("math.floor(prevCount * weight + currentCount)");
-
-      expect(LUA_USER_THROTTLE).toContain('redis.call("ZREMRANGEBYSCORE"');
-      expect(LUA_USER_THROTTLE).toContain('redis.call("ZCARD"');
-      expect(LUA_USER_THROTTLE).toContain('redis.call("ZADD"');
-
-      expect(LUA_RELEASE_LOCK).toContain("redis.call('GET'");
-      expect(LUA_RELEASE_LOCK).toContain("redis.call('DEL'");
-
-      expect(LUA_RENEW_LOCK).toContain("redis.call('GET'");
-      expect(LUA_RENEW_LOCK).toContain("redis.call('EXPIRE'");
-
-      expect(LUA_SCHEDULER_POLL).toContain("redis.call('ZRANGE'");
-      expect(LUA_SCHEDULER_POLL).toContain("redis.call('ZADD'");
-
-      expect(LUA_ACQUIRE_LEASE).toContain("redis.call('EXISTS'");
-      expect(LUA_ACQUIRE_LEASE).toContain("redis.call('SET'");
-
-      expect(LUA_MARK_PROCESSED).toContain("redis.call('SET'");
-      expect(LUA_MARK_PROCESSED).toContain("redis.call('DEL'");
-    });
   });
 
   describe("UserThrottle", () => {

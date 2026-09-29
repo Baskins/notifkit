@@ -395,6 +395,21 @@ export class StreamConsumer {
         ) {
           break; // Expected during graceful shutdown
         }
+        // The group, or the stream itself, is gone: Redis was flushed, restarted
+        // without persistence, or failed over to an empty replica. Backing off
+        // would retry the same read forever, so recreate it and keep reading.
+        if (err instanceof Error && err.message.startsWith("NOGROUP")) {
+          try {
+            await this.ensureGroup();
+            this.logger?.warn(
+              { group: this.group, streams: this.streams },
+              "consumer group was missing — recreated it",
+            );
+            continue;
+          } catch (recreateErr) {
+            this.logger?.error({ err: recreateErr }, "failed to recreate consumer group");
+          }
+        }
         this.logger?.error({ err }, "error reading from stream");
         await new Promise((resolve) => setTimeout(resolve, retryDelay));
         retryDelay = Math.min(retryDelay * 2, 30_000); // Exponential backoff up to 30s

@@ -21,6 +21,7 @@ declare module "ioredis" {
       targetTime: number | string,
       memberId: string,
       ttlSeconds: number | string,
+      pruneBefore?: number | string,
     ): Promise<number>;
     schedulerPoll(
       key: string,
@@ -107,22 +108,36 @@ export const LUA_RENEW_LOCK = `
 /**
  * User-level sliding window notification throttle.
  *
- * A member already in the window was counted by an earlier attempt at the same
+ * Members are sends scored by when they go out, which for a scheduled send is
+ * in the future. A send at targetTime is checked against the window ending at
+ * it, (windowStart, targetTime], so sends scheduled later do not count against
+ * it. Pruning uses pruneBefore (now minus one window), never windowStart: a
+ * check for a far-future send must not delete sends that went out today.
+ *
+ * A member already present was counted by an earlier attempt at the same
  * message (a replay after a crash), so it is allowed again without counting
  * twice. Returns 0 in that case, otherwise the would-be count.
+ *
+ * ARGV: windowStart, limit, targetTime, member, ttlSeconds, pruneBefore
  */
 export const LUA_USER_THROTTLE = `
-  redis.call("ZREMRANGEBYSCORE", KEYS[1], "-inf", ARGV[1])
+  local limit = tonumber(ARGV[2])
+  local targetTime = tonumber(ARGV[3])
+  local ttl = tonumber(ARGV[5])
+  redis.call("ZREMRANGEBYSCORE", KEYS[1], "-inf", ARGV[6] or ARGV[1])
   if redis.call("ZSCORE", KEYS[1], ARGV[4]) then
     return 0
   end
-  local count = redis.call("ZCARD", KEYS[1])
-  if tonumber(count) < tonumber(ARGV[2]) then
-    redis.call("ZADD", KEYS[1], tonumber(ARGV[3]), ARGV[4])
-    redis.call("EXPIRE", KEYS[1], tonumber(ARGV[5]))
-    return tonumber(count) + 1
+  local count = redis.call("ZCOUNT", KEYS[1], "(" .. ARGV[1], targetTime)
+  if count < limit then
+    redis.call("ZADD", KEYS[1], targetTime, ARGV[4])
+    -- Only ever extend: a send today must not cut short the life of a key
+    -- that is still holding a send scheduled for next week.
+    if redis.call("TTL", KEYS[1]) < ttl then
+      redis.call("EXPIRE", KEYS[1], ttl)
+    end
   end
-  return tonumber(count) + 1
+  return count + 1
 `;
 
 /** Polls scheduler zsets with visibility timeouts. */
