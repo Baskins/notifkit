@@ -1,25 +1,24 @@
 import { loadEnv, readBaseConfig } from "@/index.js";
-import { createLogger } from "@/index.js";
-import { RedisClient } from "@/index.js";
+import type { Logger } from "@/index.js";
+import type { RedisClient } from "@/index.js";
 import {
-  StreamConsumer,
-  PendingMessageScanner,
+  type StreamConsumer,
+  type PendingMessageScanner,
   StreamProducer,
   type StreamMessage,
 } from "@/index.js";
 import { BaseWorker } from "@/index.js";
 import { STREAMS, CONSUMER_GROUPS, buildStreamEvent } from "@/index.js";
-import { type StreamName } from "@/contracts/streams.js";
-import { createDatabase } from "@/db/index.js";
 import { insertMessageLogs } from "@/db/bulk.js";
 import { workflowWaiters, workflowSteps, workflowInstances } from "@/db/schema.js";
 import { eq, and, or, isNull, gt } from "drizzle-orm";
 import { type WorkerOptions } from "@/shared/index.js";
 import { startHealthReporter } from "@/workers/index.js";
+import { createStreamConsumer, createWorkerRuntime, shutdownWorker } from "@/workers/bootstrap.js";
 
 loadEnv();
 const config = readBaseConfig();
-let logger: ReturnType<typeof createLogger>;
+let logger: Logger;
 let redis: RedisClient;
 let sql: any;
 let db: any;
@@ -360,11 +359,7 @@ export class EventWorker extends BaseWorker {
 }
 
 export async function startEventWorker() {
-  logger = createLogger({ name: "event-worker", level: config.LOG_LEVEL });
-  redis = RedisClient.shared({ url: config.REDIS_URL, name: "events", logger });
-  const dbData = createDatabase({ url: config.DATABASE_URL, applicationName: "events", logger });
-  sql = dbData.sql;
-  db = dbData.db;
+  ({ logger, redis, sql, db } = createWorkerRuntime(config, "events", "event-worker"));
   workflowProducer = new StreamProducer({
     redis: redis.native,
     stream: STREAMS.WORKFLOW_INBOUND,
@@ -376,26 +371,18 @@ export async function startEventWorker() {
     config.WORKER_CONCURRENCY,
     config.DELIVERY_CONCURRENCY ?? config.WORKER_CONCURRENCY,
   );
-  consumer = new StreamConsumer({
-    redis: redis.native,
-    stream: STREAMS.EVENTS_INBOUND as StreamName,
-    group: CONSUMER_GROUPS.EVENTS as any,
-    consumer: `events-${process.pid}`,
-    dlqStream: STREAMS.DEAD_LETTER,
-    batchSize: eventsConcurrency,
-    bufferAcks: true,
-    // Log rows are not latency-sensitive; let reads fill up.
-    coalesceMs: 10,
-    logger,
-  });
-
-  pendingScanner = new PendingMessageScanner({
-    redis: redis.native,
-    stream: STREAMS.EVENTS_INBOUND as StreamName,
-    group: CONSUMER_GROUPS.EVENTS as any,
-    consumer: `events-${process.pid}`,
-    logger,
-  });
+  ({ consumer, pendingScanner } = createStreamConsumer(
+    { redis, logger },
+    {
+      stream: STREAMS.EVENTS_INBOUND,
+      group: CONSUMER_GROUPS.EVENTS,
+      consumer: `events-${process.pid}`,
+      batchSize: eventsConcurrency,
+      bufferAcks: true,
+      // Log rows are not latency-sensitive; let reads fill up.
+      coalesceMs: 10,
+    },
+  ));
 
   worker = new EventWorker({
     consumer,
@@ -413,10 +400,6 @@ export async function startEventWorker() {
 }
 
 export async function stopEventWorker(): Promise<void> {
-  logger?.info("shutdown initiated");
-  if (healthInterval) clearInterval(healthInterval);
-  if (worker) await worker.stop();
-  if (sql) await sql.end();
-  if (redis) await redis.disconnect();
-  logger?.info("event worker stopped");
+  await shutdownWorker("event worker", { logger, timers: [healthInterval], worker, sql, redis });
+  healthInterval = null;
 }

@@ -454,9 +454,7 @@ describe("UserThrottle (Priority-Aware Throttling)", () => {
 
   beforeEach(() => {
     mockRedis = {
-      incr: vi.fn(),
-      expire: vi.fn(),
-      eval: vi.fn(),
+      throttleUser: vi.fn(),
     };
   });
 
@@ -465,80 +463,80 @@ describe("UserThrottle (Priority-Aware Throttling)", () => {
     const result = await throttle.check("proj-1", "usr-1", "critical");
 
     expect(result.allowed).toBe(true);
-    expect(mockRedis.eval).not.toHaveBeenCalled();
+    expect(mockRedis.throttleUser).not.toHaveBeenCalled();
   });
 
   it("throttles normal notifications when limit is exceeded", async () => {
     const throttle = new UserThrottle({ redis: mockRedis, maxPerHour: 3 });
-    mockRedis.eval.mockResolvedValueOnce(4);
+    mockRedis.throttleUser.mockResolvedValueOnce(4);
 
     const result = await throttle.check("proj-1", "usr-1", "normal");
 
     expect(result.allowed).toBe(false);
-    expect(mockRedis.eval).toHaveBeenCalled();
+    expect(mockRedis.throttleUser).toHaveBeenCalled();
   });
 
-  // eval args: [script, numkeys, key, windowStart, limit, targetTime, memberId, ttl]
-  const argWindowStart = (call: any[]) => call[3];
-  const argLimit = (call: any[]) => call[4];
-  const argTargetTime = (call: any[]) => call[5];
+  // throttleUser args: [key, windowStart, limit, targetTime, memberId, ttl]
+  const argWindowStart = (call: any[]) => call[1];
+  const argLimit = (call: any[]) => call[2];
+  const argTargetTime = (call: any[]) => call[3];
   /** Window length the script was actually asked to enforce. */
   const windowMsOf = (call: any[]) => argTargetTime(call) - argWindowStart(call);
 
   it("counts a message under its own id, so a retry is not counted twice", async () => {
     const throttle = new UserThrottle({ redis: mockRedis, maxPerHour: 3 });
-    mockRedis.eval.mockResolvedValue(1);
+    mockRedis.throttleUser.mockResolvedValue(1);
 
     await throttle.check("proj-1", "usr-1", "normal", { messageId: "evt-1:usr-1:email" });
     await throttle.check("proj-1", "usr-1", "normal", { messageId: "evt-1:usr-1:email" });
 
-    const members = mockRedis.eval.mock.calls.map((c: any[]) => c[6]);
+    const members = mockRedis.throttleUser.mock.calls.map((c: any[]) => c[4]);
     expect(members).toEqual(["evt-1:usr-1:email", "evt-1:usr-1:email"]);
   });
 
   it("applies a per-project limit override in place of the global default", async () => {
     const throttle = new UserThrottle({ redis: mockRedis, maxPerHour: 3 });
-    mockRedis.eval.mockResolvedValueOnce(40);
+    mockRedis.throttleUser.mockResolvedValueOnce(40);
 
     const result = await throttle.check("proj-1", "usr-1", "normal", { limit: 50 });
 
     expect(result.allowed).toBe(true);
     expect(result.limit).toBe(50);
-    expect(argLimit(mockRedis.eval.mock.calls[0])).toBe(50);
+    expect(argLimit(mockRedis.throttleUser.mock.calls[0])).toBe(50);
   });
 
   it("applies a per-project window override", async () => {
     const throttle = new UserThrottle({ redis: mockRedis, maxPerHour: 3 });
-    mockRedis.eval.mockResolvedValueOnce(1);
+    mockRedis.throttleUser.mockResolvedValueOnce(1);
 
     await throttle.check("proj-1", "usr-1", "normal", { windowHours: 24 });
 
     // The window must span a full 24h, not the default hour.
-    expect(windowMsOf(mockRedis.eval.mock.calls[0])).toBe(24 * 3600_000);
+    expect(windowMsOf(mockRedis.throttleUser.mock.calls[0])).toBe(24 * 3600_000);
   });
 
   it("falls back to the default when overrides are null or nonsensical", async () => {
     const throttle = new UserThrottle({ redis: mockRedis, maxPerHour: 7, windowHours: 1 });
-    mockRedis.eval.mockResolvedValue(1);
+    mockRedis.throttleUser.mockResolvedValue(1);
 
     await throttle.check("proj-1", "usr-1", "normal", { limit: null, windowHours: null });
-    expect(argLimit(mockRedis.eval.mock.calls[0])).toBe(7);
+    expect(argLimit(mockRedis.throttleUser.mock.calls[0])).toBe(7);
 
     // A stored zero or negative window would make the window meaningless.
     await throttle.check("proj-1", "usr-1", "normal", { windowHours: 0 });
-    expect(windowMsOf(mockRedis.eval.mock.calls[1])).toBe(3600_000);
+    expect(windowMsOf(mockRedis.throttleUser.mock.calls[1])).toBe(3600_000);
 
     await throttle.check("proj-1", "usr-1", "normal", { windowHours: -5 });
-    expect(windowMsOf(mockRedis.eval.mock.calls[2])).toBe(3600_000);
+    expect(windowMsOf(mockRedis.throttleUser.mock.calls[2])).toBe(3600_000);
   });
 
   it("treats a limit of 0 as a deliberate kill switch, not a missing value", async () => {
     const throttle = new UserThrottle({ redis: mockRedis, maxPerHour: 100 });
-    mockRedis.eval.mockResolvedValueOnce(1);
+    mockRedis.throttleUser.mockResolvedValueOnce(1);
 
     const result = await throttle.check("proj-1", "usr-1", "normal", { limit: 0 });
 
-    expect(argLimit(mockRedis.eval.mock.calls[0])).toBe(0);
+    expect(argLimit(mockRedis.throttleUser.mock.calls[0])).toBe(0);
     expect(result.allowed).toBe(false);
   });
 
@@ -548,7 +546,7 @@ describe("UserThrottle (Priority-Aware Throttling)", () => {
     const result = await throttle.check("proj-1", "usr-1", "critical", { limit: 0 });
 
     expect(result.allowed).toBe(true);
-    expect(mockRedis.eval).not.toHaveBeenCalled();
+    expect(mockRedis.throttleUser).not.toHaveBeenCalled();
   });
 });
 
@@ -1053,15 +1051,6 @@ describe("DeliveryWorker", () => {
     };
     mockConsumer = { ack: vi.fn(), nack: vi.fn(), redis: { incr: vi.fn(), expire: vi.fn() } };
 
-    // Set rate limits to undefined to skip throttling logic for these tests
-    vi.mock("../src/rate-limiter/index.js", async (importOriginal) => {
-      const actual = await importOriginal<any>();
-      return {
-        ...actual,
-        throttleProvider: vi.fn(),
-      };
-    });
-
     worker = new DeliveryWorker({
       consumer: mockConsumer as any,
       pendingScanner: {} as any,
@@ -1503,7 +1492,7 @@ describe("DeliveryWorker", () => {
       const send = vi.fn();
       mockTransportRegistry.getAll.mockReturnValue([limitedTransport(send)]);
       // The lease script grants no tokens: the window's budget is spent.
-      mockRedis.eval = vi.fn().mockResolvedValue(0);
+      mockRedis.leaseApiRateLimit = vi.fn().mockResolvedValue(0);
 
       await worker.process(dispatched() as any);
 
@@ -1517,7 +1506,7 @@ describe("DeliveryWorker", () => {
 
     it("counts each throttled attempt so the retries cannot loop forever", async () => {
       mockTransportRegistry.getAll.mockReturnValue([limitedTransport(vi.fn())]);
-      mockRedis.eval = vi.fn().mockResolvedValue(0);
+      mockRedis.leaseApiRateLimit = vi.fn().mockResolvedValue(0);
 
       await worker.process(dispatched({ throttleAttemptCount: 2 }) as any);
 
@@ -1527,7 +1516,7 @@ describe("DeliveryWorker", () => {
     it("gives up once the throttled retries exceed maxAttempts", async () => {
       const send = vi.fn();
       mockTransportRegistry.getAll.mockReturnValue([limitedTransport(send)]);
-      mockRedis.eval = vi.fn().mockResolvedValue(0);
+      mockRedis.leaseApiRateLimit = vi.fn().mockResolvedValue(0);
 
       await worker.process(
         dispatched({ throttleAttemptCount: 3, deliveryOptions: { maxAttempts: 3 } }) as any,
@@ -1546,7 +1535,7 @@ describe("DeliveryWorker", () => {
 
     it("falls back to another channel instead of dropping an exhausted task", async () => {
       mockTransportRegistry.getAll.mockReturnValue([limitedTransport(vi.fn())]);
-      mockRedis.eval = vi.fn().mockResolvedValue(0);
+      mockRedis.leaseApiRateLimit = vi.fn().mockResolvedValue(0);
 
       await worker.process(
         dispatched({
@@ -1564,7 +1553,7 @@ describe("DeliveryWorker", () => {
     it("sends normally when the provider limit has room", async () => {
       const send = vi.fn().mockResolvedValue({ success: true, providerMessageId: "p-1" });
       mockTransportRegistry.getAll.mockReturnValue([limitedTransport(send)]);
-      mockRedis.eval = vi.fn().mockResolvedValue(1);
+      mockRedis.leaseApiRateLimit = vi.fn().mockResolvedValue(1);
 
       await worker.process(dispatched() as any);
 
@@ -1923,80 +1912,6 @@ describe("NotifkitClient API Key Support", () => {
     });
 
     expect((client as any).headers["Authorization"]).toBeUndefined();
-  });
-});
-
-import { throttleProvider } from "@/services/delivery/throttle.js";
-
-describe("throttleProvider (Provider-Level Rate Limiting)", () => {
-  let mockRedis: any;
-  let mockLogger: any;
-
-  beforeEach(() => {
-    mockRedis = {
-      eval: vi.fn(),
-    };
-    mockLogger = {
-      warn: vi.fn(),
-      info: vi.fn(),
-    };
-  });
-
-  it("allows requests and records them if under the limit", async () => {
-    mockRedis.eval.mockResolvedValueOnce([1, 0]);
-
-    const result = await throttleProvider(
-      mockRedis,
-      "email",
-      { limit: 2, windowSeconds: 10 },
-      mockLogger,
-    );
-
-    expect(mockRedis.eval).toHaveBeenCalled();
-    expect(result.allowed).toBe(true);
-    expect(mockLogger.warn).not.toHaveBeenCalled();
-  });
-
-  it("returns retryAfterMs and logs warning if over the limit", async () => {
-    const oldestTimestamp = Date.now() - 200;
-    mockRedis.eval.mockResolvedValueOnce([0, oldestTimestamp]);
-
-    const result = await throttleProvider(
-      mockRedis,
-      "email",
-      { limit: 2, windowSeconds: 0.5 },
-      mockLogger,
-    );
-
-    expect(mockRedis.eval).toHaveBeenCalled();
-    expect(result.allowed).toBe(false);
-    expect(result.retryAfterMs).toBeGreaterThanOrEqual(100);
-    expect(mockLogger.warn).toHaveBeenCalled();
-  });
-
-  it("caps retryAfterMs at 0 when oldestTimestamp exceeds window boundary", async () => {
-    // Oldest timestamp is way in the past (e.g. 5 seconds ago on a 1s window)
-    const oldestTimestamp = Date.now() - 5000;
-    mockRedis.eval.mockResolvedValueOnce([0, oldestTimestamp]);
-
-    const result = await throttleProvider(
-      mockRedis,
-      "sms",
-      { limit: 5, windowSeconds: 1 },
-      mockLogger,
-    );
-
-    expect(result.allowed).toBe(false);
-    expect(result.retryAfterMs).toBe(0);
-  });
-
-  it("uses separate rate limit keys for different channels", async () => {
-    mockRedis.eval.mockResolvedValue([1, 0]);
-
-    await throttleProvider(mockRedis, "push", { limit: 10, windowSeconds: 60 }, mockLogger);
-
-    const callArgs = mockRedis.eval.mock.calls[0];
-    expect(callArgs[2]).toBe("rate-limit:provider:push");
   });
 });
 
@@ -2761,7 +2676,6 @@ describe("SchedulerWorker", () => {
     };
     mockRedis = {
       zadd: vi.fn(),
-      eval: vi.fn(),
       get: vi.fn(),
       del: vi.fn(),
       set: vi.fn().mockResolvedValue("OK"),
@@ -2808,12 +2722,12 @@ describe("SchedulerWorker", () => {
       get: vi.fn(),
       del: vi.fn(),
       zrem: vi.fn(),
-      eval: vi.fn(),
+      schedulerPoll: vi.fn(),
       exec: vi.fn(),
     };
     mockRedis.pipeline = vi.fn().mockReturnValue(mockPipeline);
     mockRedis.set.mockResolvedValue("OK");
-    mockRedis.eval = vi.fn().mockResolvedValue(1);
+    mockRedis.releaseLock = vi.fn().mockResolvedValue(1);
 
     mockPipeline.exec
       .mockResolvedValueOnce([
@@ -2831,9 +2745,6 @@ describe("SchedulerWorker", () => {
         ],
       ])
       .mockResolvedValueOnce([[null, JSON.stringify({ priority: "normal", someField: "x" })]]);
-
-    // Instead of mockRedis.eval
-    // mockRedis.eval.mockResolvedValue([ ... ]);
 
     const mockOutboundProducers = {
       normal: { publishBatch: vi.fn() },
@@ -2854,9 +2765,7 @@ describe("SchedulerWorker", () => {
       mockDb as any,
     );
 
-    expect(mockPipeline.eval).toHaveBeenCalledWith(
-      expect.any(String),
-      1,
+    expect(mockPipeline.schedulerPoll).toHaveBeenCalledWith(
       expect.stringMatching(/^notif:scheduled:zset:\d+$/),
       expect.any(Number),
       100,
@@ -2877,7 +2786,6 @@ describe("Integration: Engine -> Scheduler Handoff with real registry", () => {
     const mockRedis: any = {
       set: vi.fn(),
       zadd: vi.fn(),
-      eval: vi.fn(),
       get: vi.fn(),
       del: vi.fn(),
       pipeline: vi.fn().mockReturnValue({
@@ -3288,7 +3196,7 @@ describe("DeliveryWorker", () => {
       unmark: vi.fn().mockResolvedValue(undefined),
     };
     mockRedis = {
-      eval: vi.fn().mockResolvedValue([1, 1000]), // Default to allowed
+      leaseApiRateLimit: vi.fn().mockResolvedValue(1), // Default to allowed
     };
     mockScheduledProducer = { publish: vi.fn() };
     mockEnrichedProducers = { normal: { publish: vi.fn() } };
@@ -3338,32 +3246,6 @@ describe("DeliveryWorker", () => {
   afterEach(async () => {
     vi.clearAllMocks();
     if (worker) await worker.stop();
-  });
-
-  it("handles provider throttling and schedules retry", async () => {
-    // Mock redis.eval to return rate limit exceeded
-    mockRedis.eval.mockResolvedValue([0, 5000]); // 0 = denied, 5000 = retry after
-
-    const msg = {
-      id: "msg-del-1",
-      event: {
-        payload: {
-          taskId: "task-1",
-          projectId: "proj-1",
-          enrichedEventId: "evt-1",
-          recipientId: "usr-1",
-          channel: "email",
-          destination: "test@example.com",
-          priority: "normal",
-        },
-        metadata: { traceId: "trace-1" },
-      },
-    };
-
-    await worker.process(msg as any);
-
-    // Bypassing throttling test because getProviderRateLimits is empty config.
-    // Just expect it to drop/fail or process normally without throttling
   });
 
   it("falls back to next channel on transport failure", async () => {

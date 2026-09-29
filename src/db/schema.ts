@@ -15,7 +15,6 @@ import {
   integer,
 } from "drizzle-orm/pg-core";
 import { sql } from "drizzle-orm";
-import { createInsertSchema, createSelectSchema } from "drizzle-zod";
 
 export const channelEnum = pgEnum("channel", [
   "email",
@@ -376,50 +375,3 @@ export const adminUsers = pgTable("admin_users", {
   createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
   updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
 });
-
-// ─── Generated Zod Schemas ──────────────────────────────────────────────────
-
-export const insertAdminUserSchema = createInsertSchema(adminUsers);
-export const selectAdminUserSchema = createSelectSchema(adminUsers);
-
-export const insertProjectSchema = createInsertSchema(projects);
-export const selectProjectSchema = createSelectSchema(projects);
-
-export const insertProjectApiKeySchema = createInsertSchema(projectApiKeys);
-export const selectProjectApiKeySchema = createSelectSchema(projectApiKeys);
-
-export const insertUserSchema = createInsertSchema(users);
-export const selectUserSchema = createSelectSchema(users);
-
-export const insertUserSegmentSchema = createInsertSchema(userSegments);
-export const selectUserSegmentSchema = createSelectSchema(userSegments);
-
-export const insertUserContactSchema = createInsertSchema(userContacts);
-export const selectUserContactSchema = createSelectSchema(userContacts);
-
-export const insertUserChannelPreferenceSchema = createInsertSchema(userChannelPreferences);
-export const selectUserChannelPreferenceSchema = createSelectSchema(userChannelPreferences);
-
-export const insertUserTopicPreferenceSchema = createInsertSchema(userTopicPreferences);
-export const selectUserTopicPreferenceSchema = createSelectSchema(userTopicPreferences);
-
-export const insertMessageLogSchema = createInsertSchema(messageLogs);
-export const selectMessageLogSchema = createSelectSchema(messageLogs);
-
-export const insertSuppressionSchema = createInsertSchema(suppressions);
-export const selectSuppressionSchema = createSelectSchema(suppressions);
-
-export const insertWorkflowInstanceSchema = createInsertSchema(workflowInstances);
-export const selectWorkflowInstanceSchema = createSelectSchema(workflowInstances);
-
-export const insertWorkflowStepSchema = createInsertSchema(workflowSteps);
-export const selectWorkflowStepSchema = createSelectSchema(workflowSteps);
-
-export const insertWorkflowWaiterSchema = createInsertSchema(workflowWaiters);
-export const selectWorkflowWaiterSchema = createSelectSchema(workflowWaiters);
-
-export const insertDeliveryOutboxSchema = createInsertSchema(deliveryOutbox);
-export const selectDeliveryOutboxSchema = createSelectSchema(deliveryOutbox);
-
-export const insertScheduledPayloadSchema = createInsertSchema(scheduledPayloads);
-export const selectScheduledPayloadSchema = createSelectSchema(scheduledPayloads);

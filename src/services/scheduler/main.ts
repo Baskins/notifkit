@@ -1,13 +1,8 @@
 import { randomUUID } from "node:crypto";
 import { loadEnv, readBaseConfig } from "@/index.js";
-import { createLogger } from "@/index.js";
-import { RedisClient, type Redis } from "@/index.js";
-import {
-  StreamConsumer,
-  PendingMessageScanner,
-  StreamProducer,
-  type StreamMessage,
-} from "@/index.js";
+import type { Logger } from "@/index.js";
+import type { RedisClient, Redis } from "@/index.js";
+import { type StreamConsumer, type PendingMessageScanner, type StreamMessage } from "@/index.js";
 import { BaseWorker } from "@/index.js";
 import {
   STREAMS,
@@ -16,17 +11,22 @@ import {
   buildStreamEvent,
   type NotificationScheduledPayload,
 } from "@/index.js";
-import { getPriorityBucket, type WorkerOptions, LUA_SCHEDULER_POLL } from "@/shared/index.js";
-import { createDatabase } from "@/db/index.js";
+import { getPriorityBucket, type WorkerOptions } from "@/shared/index.js";
 import { scheduledPayloads } from "@/db/schema.js";
 import { inArray } from "drizzle-orm";
 import { startHealthReporter } from "@/workers/index.js";
+import {
+  createPriorityProducers,
+  createStreamConsumer,
+  createWorkerRuntime,
+  shutdownWorker,
+} from "@/workers/bootstrap.js";
 // ─── Bootstrap ─────────────────────────────────────────────────────────────
 
 loadEnv();
 const config = readBaseConfig();
 
-let logger: ReturnType<typeof createLogger>;
+let logger: Logger;
 let redis: RedisClient;
 let sql: any;
 let db: any;
@@ -106,11 +106,7 @@ export async function executeSchedulerPoll(
 
     for (let i = 0; i < 16; i++) {
       const shardKey = `notif:scheduled:zset:${i}`;
-      if (typeof pipeline.schedulerPoll === "function") {
-        pipeline.schedulerPoll(shardKey, now, perShardLimit, visibilityTimeout);
-      } else {
-        pipeline.eval(LUA_SCHEDULER_POLL, 1, shardKey, now, perShardLimit, visibilityTimeout);
-      }
+      pipeline.schedulerPoll(shardKey, now, perShardLimit, visibilityTimeout);
     }
 
     const results = await pipeline.exec();
@@ -206,56 +202,24 @@ export async function executeSchedulerPoll(
     return false;
   } finally {
     if (acquired) {
-      if (typeof redis.releaseLock === "function") {
-        await redis.releaseLock(lockKey, lockOwner).catch(() => {});
-      } else {
-        // Delete the lock only if we still own it
-        const lua = `
-        if redis.call("get", KEYS[1]) == ARGV[1] then
-          return redis.call("del", KEYS[1])
-        else
-          return 0
-        end
-      `;
-        await redis.eval(lua, 1, lockKey, lockOwner).catch(() => {});
-      }
+      await redis.releaseLock(lockKey, lockOwner).catch(() => {});
     }
   }
 }
 
 export async function startSchedulerWorker() {
-  logger = createLogger({ name: "scheduler", level: config.LOG_LEVEL });
-  redis = RedisClient.shared({ url: config.REDIS_URL, name: "scheduler", logger });
-  const dbData = createDatabase({ url: config.DATABASE_URL, applicationName: "scheduler", logger });
-  sql = dbData.sql;
-  db = dbData.db;
-  consumer = new StreamConsumer({
-    redis: redis.native,
-    stream: STREAMS.SCHEDULED,
-    group: CONSUMER_GROUPS.SCHEDULER,
-    consumer: `scheduler-${process.pid}`,
-    dlqStream: STREAMS.DEAD_LETTER,
-    batchSize: config.WORKER_CONCURRENCY,
-    logger,
-  });
+  ({ logger, redis, sql, db } = createWorkerRuntime(config, "scheduler"));
+  ({ consumer, pendingScanner } = createStreamConsumer(
+    { redis, logger },
+    {
+      stream: STREAMS.SCHEDULED,
+      group: CONSUMER_GROUPS.SCHEDULER,
+      consumer: `scheduler-${process.pid}`,
+      batchSize: config.WORKER_CONCURRENCY,
+    },
+  ));
 
-  pendingScanner = new PendingMessageScanner({
-    redis: redis.native,
-    stream: STREAMS.SCHEDULED,
-    group: CONSUMER_GROUPS.SCHEDULER,
-    consumer: `scheduler-${process.pid}`,
-    logger,
-  });
-
-  const outboundProducers = {
-    critical: new StreamProducer({
-      redis: redis.native,
-      stream: STREAMS.OUTBOUND_CRITICAL,
-      logger,
-    }),
-    normal: new StreamProducer({ redis: redis.native, stream: STREAMS.OUTBOUND_NORMAL, logger }),
-    low: new StreamProducer({ redis: redis.native, stream: STREAMS.OUTBOUND_LOW, logger }),
-  };
+  const outboundProducers = createPriorityProducers(redis.native, logger, "OUTBOUND");
 
   // ─── Stage 4a: Scheduled notification processor ─────────────────────────────
   //
@@ -300,18 +264,14 @@ export async function startSchedulerWorker() {
 // ─── Shutdown ──────────────────────────────────────────────────────────────
 
 export async function stopSchedulerWorker(): Promise<void> {
-  logger?.info("shutdown initiated");
-  if (healthInterval) {
-    clearInterval(healthInterval);
-    healthInterval = null;
-  }
-  if (pollTimeout) {
-    clearTimeout(pollTimeout);
-    pollTimeout = null;
-  }
   isPolling = false;
-  if (worker) await worker.stop();
-  if (sql) await sql.end();
-  if (redis) await redis.disconnect();
-  logger?.info("scheduler stopped");
+  await shutdownWorker("scheduler", {
+    logger,
+    timers: [healthInterval, pollTimeout],
+    worker,
+    sql,
+    redis,
+  });
+  healthInterval = null;
+  pollTimeout = null;
 }

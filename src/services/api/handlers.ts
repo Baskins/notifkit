@@ -185,6 +185,19 @@ function getQueryParam(ctx: RouteContext, key: string): string | undefined {
   return (ctx.query as any)[key] ?? undefined;
 }
 
+/**
+ * Page size from `?limit=`, clamped to [1, max]. Missing or non-numeric
+ * values fall back to `fallback`; `undefined` there means "no limit".
+ */
+function parseLimit<F extends number | undefined>(
+  ctx: RouteContext,
+  fallback: F,
+  max = 100,
+): number | F {
+  const n = parseInt(getQueryParam(ctx, "limit") ?? "", 10);
+  return Number.isNaN(n) ? fallback : Math.min(Math.max(n, 1), max);
+}
+
 export function createHandlers(deps: Deps) {
   const { logger } = deps;
 
@@ -620,8 +633,7 @@ export function createHandlers(deps: Deps) {
     res: ServerResponse,
     ctx: RouteContext,
   ): Promise<void> {
-    const limitParam = parseInt(ctx.query.get("limit") || "50", 10);
-    const limit = isNaN(limitParam) ? 50 : Math.min(limitParam, 100);
+    const limit = parseLimit(ctx, 50);
     const cursor = ctx.query.get("cursor");
 
     const templateId = getQueryParam(ctx, "templateId");
@@ -794,8 +806,7 @@ export function createHandlers(deps: Deps) {
     res: ServerResponse,
     ctx: RouteContext,
   ): Promise<void> {
-    const limitParam = getQueryParam(ctx, "limit");
-    const limit = limitParam ? Math.min(parseInt(limitParam, 10), 100) : undefined;
+    const limit = parseLimit(ctx, undefined);
     const channel = getQueryParam(ctx, "channel");
     const topic = getQueryParam(ctx, "topic");
     let templates = await deps.templateRepo.list(ctx.projectId!);
@@ -845,8 +856,7 @@ export function createHandlers(deps: Deps) {
     res: ServerResponse,
     ctx: RouteContext,
   ): Promise<void> {
-    const limitParam = getQueryParam(ctx, "limit");
-    const limit = limitParam ? Math.min(parseInt(limitParam, 10), 100) : undefined;
+    const limit = parseLimit(ctx, undefined);
     const search = getQueryParam(ctx, "search")?.trim().toLowerCase();
     let workflows = await deps.workflowRepo.listDefinitions(ctx.projectId!);
     if (search) {
@@ -891,8 +901,7 @@ export function createHandlers(deps: Deps) {
     res: ServerResponse,
     ctx: RouteContext,
   ): Promise<void> {
-    const limitParam = parseInt(getQueryParam(ctx, "limit") || "50", 10);
-    const limit = isNaN(limitParam) ? 50 : Math.min(limitParam, 100);
+    const limit = parseLimit(ctx, 50);
     const cursor = getQueryParam(ctx, "cursor");
     const search = getQueryParam(ctx, "search");
     const segment = getQueryParam(ctx, "segment");
@@ -1371,8 +1380,7 @@ export function createHandlers(deps: Deps) {
     res: ServerResponse,
     ctx: RouteContext,
   ): Promise<void> {
-    const limitParam = getQueryParam(ctx, "limit");
-    const limit = limitParam ? Math.min(parseInt(limitParam, 10), 100) : 50;
+    const limit = parseLimit(ctx, 50);
     const cursor = getQueryParam(ctx, "cursor");
     const channel = getQueryParam(ctx, "channel");
 
@@ -1642,8 +1650,7 @@ code{background:#f4f4f5;padding:.1rem .35rem;border-radius:4px}</style>
     res: ServerResponse,
     ctx: RouteContext,
   ): Promise<void> {
-    const limitParam = parseInt(getQueryParam(ctx, "limit") || "20", 10);
-    const limit = isNaN(limitParam) ? 20 : Math.min(Math.max(limitParam, 1), 100);
+    const limit = parseLimit(ctx, 20);
     const search = getQueryParam(ctx, "search")?.trim();
     const channel = getQueryParam(ctx, "channel")?.trim();
     const since = getQueryParam(ctx, "since")?.trim();
@@ -1819,8 +1826,7 @@ code{background:#f4f4f5;padding:.1rem .35rem;border-radius:4px}</style>
     res: ServerResponse,
     ctx: RouteContext,
   ): Promise<void> {
-    const limitParam = parseInt(getQueryParam(ctx, "limit") || "100", 10);
-    const limit = isNaN(limitParam) ? 100 : Math.min(Math.max(limitParam, 1), 500);
+    const limit = parseLimit(ctx, 100, 500);
     const channel = getQueryParam(ctx, "channel");
     const reason = getQueryParam(ctx, "reason");
     const target = getQueryParam(ctx, "target");

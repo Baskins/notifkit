@@ -1,9 +1,6 @@
 import type { Redis } from "@/index.js";
 import { LRUCache } from "@/shared/index.js";
-import { LUA_USER_THROTTLE, LUA_LEASE_API_RATE_LIMIT } from "@/redis/index.js";
 import type { Logger } from "@/logger/index.js";
-
-export { LUA_USER_THROTTLE, LUA_LEASE_API_RATE_LIMIT };
 
 import { randomUUID } from "crypto";
 
@@ -192,19 +189,14 @@ export class UserThrottle {
       Math.ceil((targetTime - Date.now()) / 1000) + windowSeconds,
     );
 
-    const count =
-      typeof this.redis.throttleUser === "function"
-        ? await this.redis.throttleUser(key, windowStart, limit, targetTime, memberId, ttlSeconds)
-        : ((await this.redis.eval(
-            LUA_USER_THROTTLE,
-            1,
-            key,
-            windowStart,
-            limit,
-            targetTime,
-            memberId,
-            ttlSeconds,
-          )) as number);
+    const count = await this.redis.throttleUser(
+      key,
+      windowStart,
+      limit,
+      targetTime,
+      memberId,
+      ttlSeconds,
+    );
 
     return { allowed: count <= limit, count, limit };
   }
@@ -354,28 +346,14 @@ export class ApiRateLimiter {
     let inFlightRef: Promise<number> | null = null;
     const executeLease = async (): Promise<number> => {
       try {
-        let granted: number;
-        if (typeof this.redis.leaseApiRateLimit === "function") {
-          granted = await this.redis.leaseApiRateLimit(
-            currentKey,
-            prevKey,
-            nowMs,
-            this.windowMs,
-            limitRpm,
-            requested,
-          );
-        } else {
-          granted = (await this.redis.eval(
-            LUA_LEASE_API_RATE_LIMIT,
-            2,
-            currentKey,
-            prevKey,
-            nowMs,
-            this.windowMs,
-            limitRpm,
-            requested,
-          )) as number;
-        }
+        let granted = await this.redis.leaseApiRateLimit(
+          currentKey,
+          prevKey,
+          nowMs,
+          this.windowMs,
+          limitRpm,
+          requested,
+        );
 
         // On invalid return or negative, fail-open
         if (typeof granted !== "number" || granted < 0) {

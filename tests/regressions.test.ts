@@ -3,7 +3,7 @@ import { renderWithTemplate } from "@/templates/render.js";
 import { UserThrottle, ProjectSettingsCache } from "@/rate-limiter/index.js";
 import { PendingMessageScanner } from "@/queue/index.js";
 import { isRetryableAiError, PermanentAiError } from "@/services/ai/main.js";
-import { LUA_SCHEDULER_POLL } from "@/shared/index.js";
+import { LUA_SCHEDULER_POLL } from "@/redis/index.js";
 import { EngineWorker } from "@/services/engine/main.js";
 import { SchedulerWorker } from "@/services/scheduler/main.js";
 import { registry } from "@/index.js";
@@ -58,14 +58,14 @@ describe("renderWithTemplate (P1-5: template injection / JSON break)", () => {
 
 describe("UserThrottle (P1-8: tenant isolation)", () => {
   it("namespaces the throttle key by project", async () => {
-    const redis: any = { eval: vi.fn().mockResolvedValue(1) };
+    const redis: any = { throttleUser: vi.fn().mockResolvedValue(1) };
     const throttle = new UserThrottle({ redis, maxPerHour: 5 });
 
     await throttle.check("proj-a", "user-1", "normal");
     await throttle.check("proj-b", "user-1", "normal");
 
-    const keyA = redis.eval.mock.calls[0][2];
-    const keyB = redis.eval.mock.calls[1][2];
+    const keyA = redis.throttleUser.mock.calls[0][0];
+    const keyB = redis.throttleUser.mock.calls[1][0];
 
     expect(keyA).toBe("throttle:proj-a:user:user-1");
     expect(keyB).toBe("throttle:proj-b:user:user-1");

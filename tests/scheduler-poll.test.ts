@@ -40,7 +40,7 @@ interface Harness {
 
 function harness(options: { shards?: any[]; lock?: string | null } = {}): Harness {
   const pollPipeline = {
-    eval: vi.fn(),
+    schedulerPoll: vi.fn(),
     exec: vi.fn().mockResolvedValue(options.shards ?? shardReplies()),
   };
   const cleanupPipeline = { zrem: vi.fn(), exec: vi.fn().mockResolvedValue([]) };
@@ -48,7 +48,7 @@ function harness(options: { shards?: any[]; lock?: string | null } = {}): Harnes
   let pipelineCall = 0;
   const redis = {
     set: vi.fn().mockResolvedValue(options.lock === undefined ? "OK" : options.lock),
-    eval: vi.fn().mockResolvedValue(1),
+    releaseLock: vi.fn().mockResolvedValue(1),
     pipeline: vi.fn(() => (pipelineCall++ === 0 ? pollPipeline : cleanupPipeline)),
   };
 
@@ -95,12 +95,9 @@ describe("executeSchedulerPoll", () => {
       const h = harness();
       await run(h);
 
-      // A compare-and-delete: an expired lock now held by another poller must
-      // not be deleted by this one.
-      const [script, keyCount, key, owner] = h.redis.eval.mock.calls.at(-1)!;
-      expect(script).toContain('redis.call("get", KEYS[1])');
-      expect(script).toContain('redis.call("del", KEYS[1])');
-      expect(keyCount).toBe(1);
+      // releaseLock is a compare-and-delete: an expired lock now held by
+      // another poller must not be deleted by this one.
+      const [key, owner] = h.redis.releaseLock.mock.calls.at(-1)!;
       expect(key).toBe("notif:lock:scheduler:poll");
       expect(owner).toBe(h.redis.set.mock.calls[0]![1]);
     });
@@ -109,7 +106,7 @@ describe("executeSchedulerPoll", () => {
       const h = harness({ lock: null });
       await run(h);
 
-      expect(h.redis.eval).not.toHaveBeenCalled();
+      expect(h.redis.releaseLock).not.toHaveBeenCalled();
     });
 
     it("releases the lock even when the poll throws", async () => {
@@ -118,7 +115,7 @@ describe("executeSchedulerPoll", () => {
 
       await expect(run(h)).resolves.toBe(false);
       expect(h.logger.error).toHaveBeenCalled();
-      expect(h.redis.eval).toHaveBeenCalledTimes(1);
+      expect(h.redis.releaseLock).toHaveBeenCalledTimes(1);
     });
   });
 
@@ -127,11 +124,9 @@ describe("executeSchedulerPoll", () => {
       const h = harness();
       await run(h);
 
-      expect(h.pollPipeline.eval).toHaveBeenCalledTimes(SHARDS);
+      expect(h.pollPipeline.schedulerPoll).toHaveBeenCalledTimes(SHARDS);
       for (let i = 0; i < SHARDS; i++) {
-        expect(h.pollPipeline.eval).toHaveBeenCalledWith(
-          expect.any(String),
-          1,
+        expect(h.pollPipeline.schedulerPoll).toHaveBeenCalledWith(
           `notif:scheduled:zset:${i}`,
           expect.any(Number),
           100,

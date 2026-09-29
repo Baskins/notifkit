@@ -3,21 +3,6 @@ import type { Logger } from "@/index.js";
 
 declare module "ioredis" {
   interface Redis {
-    checkApiRateLimit(
-      currentKey: string,
-      prevKey: string,
-      now: number | string,
-      window: number | string,
-      maxReqs: number | string,
-      ttl?: number | string,
-    ): Promise<number>;
-    checkApiRateLimit1Key(
-      baseKey: string,
-      now: number | string,
-      window: number | string,
-      maxReqs: number | string,
-      ttl?: number | string,
-    ): Promise<number>;
     leaseApiRateLimit(
       currentKey: string,
       prevKey: string,
@@ -27,21 +12,6 @@ declare module "ioredis" {
       requested: number | string,
       ttl?: number | string,
     ): Promise<number>;
-    leaseApiRateLimit1Key(
-      baseKey: string,
-      now: number | string,
-      window: number | string,
-      maxReqs: number | string,
-      requested: number | string,
-      ttl?: number | string,
-    ): Promise<number>;
-    throttleProvider(
-      key: string,
-      now: number | string,
-      windowSeconds: number | string,
-      limit: number | string,
-      member: string,
-    ): Promise<[number, number]>;
     releaseLock(lockKey: string, lockToken: string): Promise<number>;
     renewLock(lockKey: string, lockToken: string, ttlSeconds: number | string): Promise<number>;
     throttleUser(
@@ -69,49 +39,6 @@ declare module "ioredis" {
     ): this;
   }
 }
-
-/**
- * Sliding-window counter approximation for API rate limiting.
- */
-export const LUA_CHECK_API_RATE_LIMIT = `
-  local currentKey = KEYS[1]
-  local prevKey = KEYS[2]
-  local now = tonumber(ARGV[1])
-  local window = tonumber(ARGV[2])
-  local maxReqs = tonumber(ARGV[3])
-  local ttl = tonumber(ARGV[4]) or (math.ceil((window * 2) / 1000) + 60)
-
-  if not now or not window or window <= 0 then
-    return -1
-  end
-  if not maxReqs or maxReqs <= 0 then
-    return -1
-  end
-
-  if not prevKey then
-    local currentBucket = math.floor(now / window)
-    local prevBucket = currentBucket - 1
-    currentKey = KEYS[1] .. ":" .. currentBucket
-    prevKey = KEYS[1] .. ":" .. prevBucket
-  end
-
-  local currentCount = tonumber(redis.call("GET", currentKey) or "0")
-  local prevCount = tonumber(redis.call("GET", prevKey) or "0")
-
-  local timeIntoCurrent = now % window
-  local weight = (window - timeIntoCurrent) / window
-  local estimated = math.floor(prevCount * weight + currentCount)
-
-  if estimated < maxReqs then
-    local newCount = redis.call("INCR", currentKey)
-    if newCount == 1 then
-      redis.call("EXPIRE", currentKey, ttl)
-    end
-    return estimated + 1
-  end
-
-  return -1
-`;
 
 /**
  * Sliding-window token leasing for high-throughput API rate limiting.
@@ -159,39 +86,6 @@ export const LUA_LEASE_API_RATE_LIMIT = `
   end
 
   return toGrant
-`;
-
-/**
- * Sliding-window rate limiter for external provider dispatch.
- */
-export const LUA_THROTTLE_PROVIDER = `
-  local key = KEYS[1]
-  local now = tonumber(ARGV[1])
-  local windowSeconds = tonumber(ARGV[2])
-  local limit = tonumber(ARGV[3])
-  local member = ARGV[4]
-
-  local clearBefore = now - (windowSeconds * 1000)
-  
-  -- Cleanup expired scores
-  redis.call('ZREMRANGEBYSCORE', key, 0, clearBefore)
-  
-  -- Get current count
-  local count = redis.call('ZCARD', key)
-  
-  if count >= limit then
-    -- Find the oldest score
-    local oldest = redis.call('ZRANGE', key, 0, 0, 'WITHSCORES')
-    if oldest and oldest[2] then
-      return {0, tonumber(oldest[2])}
-    end
-    return {0, now}
-  end
-  
-  -- Add new request
-  redis.call('ZADD', key, now, member)
-  redis.call('EXPIRE', key, windowSeconds * 2)
-  return {1, 0}
 `;
 
 /** Release a lock only if we still hold it (value matches our token). */
@@ -275,29 +169,9 @@ export const LUA_MARK_PROCESSED = `
  * full script strings over the wire.
  */
 export function registerCustomCommands(redis: Redis): void {
-  redis.defineCommand("checkApiRateLimit", {
-    numberOfKeys: 2,
-    lua: LUA_CHECK_API_RATE_LIMIT,
-  });
-
-  redis.defineCommand("checkApiRateLimit1Key", {
-    numberOfKeys: 1,
-    lua: LUA_CHECK_API_RATE_LIMIT,
-  });
-
   redis.defineCommand("leaseApiRateLimit", {
     numberOfKeys: 2,
     lua: LUA_LEASE_API_RATE_LIMIT,
-  });
-
-  redis.defineCommand("leaseApiRateLimit1Key", {
-    numberOfKeys: 1,
-    lua: LUA_LEASE_API_RATE_LIMIT,
-  });
-
-  redis.defineCommand("throttleProvider", {
-    numberOfKeys: 1,
-    lua: LUA_THROTTLE_PROVIDER,
   });
 
   redis.defineCommand("releaseLock", {

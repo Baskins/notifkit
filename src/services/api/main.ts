@@ -35,25 +35,6 @@ export const API_KEY_INVALIDATION_CHANNEL = "apikey.invalidated";
 /** Default window length in milliseconds for API rate limiting (1 minute). */
 export const API_RATE_LIMIT_WINDOW_MS = 60_000;
 
-import { LUA_CHECK_API_RATE_LIMIT } from "@/redis/index.js";
-export const LUA_SLIDING_WINDOW_COUNTER = LUA_CHECK_API_RATE_LIMIT;
-
-/**
- * Evaluates the sliding window counter approximation for given parameters.
- * Pure reference function matching the Redis Lua script logic.
- */
-export function calculateSlidingWindow(
-  nowMs: number,
-  windowMs: number,
-  currentCount: number,
-  prevCount: number,
-): number {
-  if (windowMs <= 0) return 0;
-  const timeIntoCurrent = nowMs % windowMs;
-  const weight = (windowMs - timeIntoCurrent) / windowMs;
-  return Math.floor(prevCount * weight + currentCount);
-}
-
 // ─── Bootstrap ─────────────────────────────────────────────────────────────
 
 loadEnv();

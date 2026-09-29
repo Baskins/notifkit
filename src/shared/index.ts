@@ -33,7 +33,6 @@ export * from "./cache.js";
 export * from "./utils.js";
 export * from "./semaphore.js";
 export * from "./batch-processor.js";
-export * from "./cache.js";
 export * from "./circuit-breaker.js";
 export * from "./dataloader.js";
 export { type WorkerOptions } from "@/workers/index.js";

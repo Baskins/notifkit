@@ -1,10 +1,10 @@
 import { randomUUID } from "node:crypto";
 import { loadEnv, readBaseConfig } from "@/index.js";
-import { createLogger } from "@/index.js";
-import { RedisClient, type Redis } from "@/index.js";
+import type { Logger } from "@/index.js";
+import type { RedisClient, Redis } from "@/index.js";
 import {
-  StreamConsumer,
-  PendingMessageScanner,
+  type StreamConsumer,
+  type PendingMessageScanner,
   StreamProducer,
   type StreamMessage,
 } from "@/index.js";
@@ -20,11 +20,9 @@ import {
   type DispatchedTaskPayload,
   type StreamEvent,
 } from "@/index.js";
-import { type StreamName } from "@/contracts/streams.js";
 import { IdempotencyGuard } from "@/index.js";
 import { UserThrottle, ProjectSettingsCache } from "@/index.js";
 import { TemplateRepository, ContactRepository, ProjectRepository } from "@/index.js";
-import { createDatabase } from "@/db/index.js";
 import { scheduledPayloads, suppressions } from "@/db/schema.js";
 import { and, eq } from "drizzle-orm";
 import {
@@ -38,6 +36,13 @@ import {
 import { TemplateCache } from "@/templates/index.js";
 import { buildUnsubscribeHeaders } from "@/unsubscribe/index.js";
 import { startHealthReporter } from "@/workers/index.js";
+import {
+  createPriorityProducers,
+  createStreamConsumer,
+  createWorkerRuntime,
+  shutdownWorker,
+  uniqueConsumerId,
+} from "@/workers/bootstrap.js";
 
 function localTimeToUtc(
   year: number,
@@ -191,7 +196,7 @@ const NO_IDEMPOTENCY = {
 loadEnv();
 const config = readBaseConfig();
 
-let logger: ReturnType<typeof createLogger>;
+let logger: Logger;
 let redis: RedisClient;
 let sql: any;
 let db: any;
@@ -747,44 +752,24 @@ export class EngineWorker extends BaseWorker {
 let subscriber: any = null;
 
 export async function startEngineWorker() {
-  logger = createLogger({ name: "engine", level: config.LOG_LEVEL });
-  redis = RedisClient.shared({ url: config.REDIS_URL, name: "engine", logger });
-  const dbData = createDatabase({ url: config.DATABASE_URL, applicationName: "engine", logger });
-  sql = dbData.sql;
-  db = dbData.db;
+  ({ logger, redis, sql, db } = createWorkerRuntime(config, "engine"));
   templateRepo = new TemplateRepository(db);
   templateCache = new TemplateCache(templateRepo);
   const contactRepo = new ContactRepository(db);
-  const consumerId = `engine-${process.env.HOSTNAME || process.pid}-${Math.random().toString(36).slice(2, 8)}`;
-  consumer = new StreamConsumer({
-    redis: redis.native,
-    stream: ENRICHED_STREAMS as unknown as StreamName[],
-    group: CONSUMER_GROUPS.ENGINE,
-    consumer: consumerId,
-    dlqStream: STREAMS.DEAD_LETTER,
-    batchSize: config.WORKER_CONCURRENCY,
-    bufferAcks: true,
-    coalesceMs: 2,
-    logger,
-  });
+  const consumerId = uniqueConsumerId("engine");
+  ({ consumer, pendingScanner } = createStreamConsumer(
+    { redis, logger },
+    {
+      stream: ENRICHED_STREAMS,
+      group: CONSUMER_GROUPS.ENGINE,
+      consumer: consumerId,
+      batchSize: config.WORKER_CONCURRENCY,
+      bufferAcks: true,
+      coalesceMs: 2,
+    },
+  ));
 
-  pendingScanner = new PendingMessageScanner({
-    redis: redis.native,
-    stream: ENRICHED_STREAMS as unknown as StreamName[],
-    group: CONSUMER_GROUPS.ENGINE,
-    consumer: consumerId,
-    logger,
-  });
-
-  const outboundProducers = {
-    critical: new StreamProducer({
-      redis: redis.native,
-      stream: STREAMS.OUTBOUND_CRITICAL,
-      logger,
-    }),
-    normal: new StreamProducer({ redis: redis.native, stream: STREAMS.OUTBOUND_NORMAL, logger }),
-    low: new StreamProducer({ redis: redis.native, stream: STREAMS.OUTBOUND_LOW, logger }),
-  };
+  const outboundProducers = createPriorityProducers(redis.native, logger, "OUTBOUND");
 
   const scheduledProducer = new StreamProducer({
     redis: redis.native,
@@ -876,17 +861,14 @@ export function getEngineWorker(): EngineWorker | undefined {
 // ─── Shutdown ──────────────────────────────────────────────────────────────
 
 export async function stopEngineWorker(): Promise<void> {
-  logger?.info("shutdown initiated");
-  if (healthInterval) {
-    clearInterval(healthInterval);
-    healthInterval = null;
-  }
-  if (subscriber) {
-    subscriber.disconnect();
-    subscriber = null;
-  }
-  if (worker) await worker.stop();
-  if (sql) await sql.end();
-  if (redis) await redis.disconnect();
-  logger?.info("engine stopped");
+  await shutdownWorker("engine", {
+    logger,
+    timers: [healthInterval],
+    subscriber,
+    worker,
+    sql,
+    redis,
+  });
+  healthInterval = null;
+  subscriber = null;
 }

@@ -14,7 +14,8 @@ describe("WorkflowWorker Edge Cases", () => {
   beforeEach(() => {
     mockRedis = {
       set: vi.fn().mockResolvedValue("OK"),
-      eval: vi.fn().mockResolvedValue(null),
+      releaseLock: vi.fn().mockResolvedValue(1),
+      renewLock: vi.fn().mockResolvedValue(1),
       zadd: vi.fn().mockResolvedValue(1),
     };
 
@@ -599,7 +600,7 @@ describe("WorkflowWorker Edge Cases", () => {
     expect(mockDb.set).toHaveBeenCalledWith({ status: "pending" });
   });
 
-  it("always releases lock via LUA_RELEASE_LOCK in finally block", async () => {
+  it("always releases lock in finally block", async () => {
     workflowRegistry.register("test_lock_release", async (ctx) => {
       await ctx.step.notify({ template: "tpl-1", user: "u-1" });
     });
@@ -623,10 +624,7 @@ describe("WorkflowWorker Edge Cases", () => {
 
     await worker.process(msg);
 
-    // Expect eval called with LUA_RELEASE_LOCK
-    expect(mockRedis.eval).toHaveBeenCalledWith(
-      expect.stringContaining("redis.call('GET'"),
-      1,
+    expect(mockRedis.releaseLock).toHaveBeenCalledWith(
       "lock:workflow:inst-lock-rel",
       expect.any(String),
     );

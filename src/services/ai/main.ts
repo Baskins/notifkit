@@ -1,10 +1,10 @@
 import { randomUUID } from "node:crypto";
 import { loadEnv, readBaseConfig } from "@/index.js";
-import { createLogger } from "@/index.js";
-import { RedisClient, type Redis } from "@/index.js";
+import type { Logger } from "@/index.js";
+import type { RedisClient, Redis } from "@/index.js";
 import {
-  StreamConsumer,
-  PendingMessageScanner,
+  type StreamConsumer,
+  type PendingMessageScanner,
   StreamProducer,
   type StreamMessage,
 } from "@/index.js";
@@ -20,21 +20,25 @@ import {
   AI_DEFAULTS,
 } from "@/index.js";
 import { generateText } from "ai";
-import { type StreamName } from "@/contracts/streams.js";
 import { IdempotencyGuard } from "@/index.js";
 import { TemplateRepository } from "@/index.js";
-import { createDatabase } from "@/db/index.js";
 import { scheduledPayloads } from "@/db/schema.js";
 import { getPriorityBucket, globalEmitter, type WorkerOptions } from "@/shared/index.js";
 import { renderWithTemplate, TemplateCache } from "@/templates/index.js";
 import { startHealthReporter } from "@/workers/index.js";
+import {
+  createPriorityProducers,
+  createStreamConsumer,
+  createWorkerRuntime,
+  shutdownWorker,
+} from "@/workers/bootstrap.js";
 
 // ─── Bootstrap ─────────────────────────────────────────────────────────────
 
 loadEnv();
 const config = readBaseConfig();
 
-let logger: ReturnType<typeof createLogger>;
+let logger: Logger;
 let redis: RedisClient;
 let sql: any;
 let db: any;
@@ -291,40 +295,20 @@ export class AiWorker extends BaseWorker {
 }
 
 export async function startAiWorker() {
-  logger = createLogger({ name: "ai", level: config.LOG_LEVEL });
-  redis = RedisClient.shared({ url: config.REDIS_URL, name: "ai", logger });
-  const dbData = createDatabase({ url: config.DATABASE_URL, applicationName: "ai", logger });
-  sql = dbData.sql;
-  db = dbData.db;
+  ({ logger, redis, sql, db } = createWorkerRuntime(config, "ai"));
   templateRepo = new TemplateRepository(db);
   templateCache = new TemplateCache(templateRepo);
-  consumer = new StreamConsumer({
-    redis: redis.native,
-    stream: STREAMS.AI_PENDING as StreamName,
-    group: CONSUMER_GROUPS.AI,
-    consumer: `ai-${process.pid}`,
-    dlqStream: STREAMS.DEAD_LETTER,
-    batchSize: config.WORKER_CONCURRENCY,
-    logger,
-  });
+  ({ consumer, pendingScanner } = createStreamConsumer(
+    { redis, logger },
+    {
+      stream: STREAMS.AI_PENDING,
+      group: CONSUMER_GROUPS.AI,
+      consumer: `ai-${process.pid}`,
+      batchSize: config.WORKER_CONCURRENCY,
+    },
+  ));
 
-  pendingScanner = new PendingMessageScanner({
-    redis: redis.native,
-    stream: STREAMS.AI_PENDING as StreamName,
-    group: CONSUMER_GROUPS.AI,
-    consumer: `ai-${process.pid}`,
-    logger,
-  });
-
-  const outboundProducers = {
-    critical: new StreamProducer({
-      redis: redis.native,
-      stream: STREAMS.OUTBOUND_CRITICAL,
-      logger,
-    }),
-    normal: new StreamProducer({ redis: redis.native, stream: STREAMS.OUTBOUND_NORMAL, logger }),
-    low: new StreamProducer({ redis: redis.native, stream: STREAMS.OUTBOUND_LOW, logger }),
-  };
+  const outboundProducers = createPriorityProducers(redis.native, logger, "OUTBOUND");
 
   const scheduledProducer = new StreamProducer({
     redis: redis.native,
@@ -403,17 +387,14 @@ export async function startAiWorker() {
 }
 
 export async function stopAiWorker(): Promise<void> {
-  logger?.info("shutdown initiated");
-  if (healthInterval) {
-    clearInterval(healthInterval);
-    healthInterval = null;
-  }
-  if (subscriber) {
-    subscriber.disconnect();
-    subscriber = null;
-  }
-  if (worker) await worker.stop();
-  if (sql) await sql.end();
-  if (redis) await redis.disconnect();
-  logger?.info("ai stopped");
+  await shutdownWorker("ai", {
+    logger,
+    timers: [healthInterval],
+    subscriber,
+    worker,
+    sql,
+    redis,
+  });
+  healthInterval = null;
+  subscriber = null;
 }

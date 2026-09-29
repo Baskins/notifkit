@@ -1,16 +1,10 @@
 import { randomUUID } from "node:crypto";
 import { loadEnv, readBaseConfig } from "@/index.js";
-import { createLogger } from "@/index.js";
-import { RedisClient } from "@/index.js";
-import {
-  StreamConsumer,
-  PendingMessageScanner,
-  StreamProducer,
-  type StreamMessage,
-} from "@/index.js";
+import type { Logger } from "@/index.js";
+import type { RedisClient } from "@/index.js";
+import { type StreamConsumer, type PendingMessageScanner, type StreamMessage } from "@/index.js";
 import { BaseWorker, type ProcessResult } from "@/index.js";
 import {
-  STREAMS,
   INBOUND_STREAMS,
   CONSUMER_GROUPS,
   registry,
@@ -19,9 +13,7 @@ import {
   type NotificationEnrichedPayload,
   type StreamEvent,
 } from "@/index.js";
-import { type StreamName } from "@/contracts/streams.js";
 import { IdempotencyGuard } from "@/index.js";
-import { createDatabase } from "@/db/index.js";
 import {
   UserRepository,
   PreferenceRepository,
@@ -31,13 +23,20 @@ import {
 import { TemplateCache } from "@/templates/index.js";
 import { getPriorityBucket, type WorkerOptions } from "@/shared/index.js";
 import { startHealthReporter } from "@/workers/index.js";
+import {
+  createPriorityProducers,
+  createStreamConsumer,
+  createWorkerRuntime,
+  shutdownWorker,
+  uniqueConsumerId,
+} from "@/workers/bootstrap.js";
 
 // ─── Bootstrap ─────────────────────────────────────────────────────────────
 
 loadEnv();
 const config = readBaseConfig();
 
-let logger: ReturnType<typeof createLogger>;
+let logger: Logger;
 let redis: RedisClient;
 let sql: any;
 let db: any;
@@ -534,46 +533,26 @@ export class EnricherWorker extends BaseWorker {
 }
 
 export async function startEnricherWorker() {
-  logger = createLogger({ name: "enricher", level: config.LOG_LEVEL });
-  redis = RedisClient.shared({ url: config.REDIS_URL, name: "enricher", logger });
-  const dbData = createDatabase({ url: config.DATABASE_URL, applicationName: "enricher", logger });
-  sql = dbData.sql;
-  db = dbData.db;
+  ({ logger, redis, sql, db } = createWorkerRuntime(config, "enricher"));
   // A fused pipeline holds the enricher's slot through engine and delivery, so
   // it needs delivery's concurrency, not the CPU-bound default.
   const enricherConcurrency = config.PIPELINE_FUSED
     ? Math.max(config.WORKER_CONCURRENCY, config.DELIVERY_CONCURRENCY ?? config.WORKER_CONCURRENCY)
     : config.WORKER_CONCURRENCY;
-  const consumerId = `enricher-${process.env.HOSTNAME || process.pid}-${Math.random().toString(36).slice(2, 8)}`;
-  consumer = new StreamConsumer({
-    redis: redis.native,
-    stream: INBOUND_STREAMS as unknown as StreamName[],
-    group: CONSUMER_GROUPS.ENRICHER,
-    consumer: consumerId,
-    dlqStream: STREAMS.DEAD_LETTER,
-    batchSize: enricherConcurrency,
-    bufferAcks: true,
-    coalesceMs: 2,
-    logger,
-  });
+  const consumerId = uniqueConsumerId("enricher");
+  ({ consumer, pendingScanner } = createStreamConsumer(
+    { redis, logger },
+    {
+      stream: INBOUND_STREAMS,
+      group: CONSUMER_GROUPS.ENRICHER,
+      consumer: consumerId,
+      batchSize: enricherConcurrency,
+      bufferAcks: true,
+      coalesceMs: 2,
+    },
+  ));
 
-  pendingScanner = new PendingMessageScanner({
-    redis: redis.native,
-    stream: INBOUND_STREAMS as unknown as StreamName[],
-    group: CONSUMER_GROUPS.ENRICHER,
-    consumer: consumerId,
-    logger,
-  });
-
-  const producers = {
-    critical: new StreamProducer({
-      redis: redis.native,
-      stream: STREAMS.ENRICHED_CRITICAL,
-      logger,
-    }),
-    normal: new StreamProducer({ redis: redis.native, stream: STREAMS.ENRICHED_NORMAL, logger }),
-    low: new StreamProducer({ redis: redis.native, stream: STREAMS.ENRICHED_LOW, logger }),
-  };
+  const producers = createPriorityProducers(redis.native, logger, "ENRICHED");
 
   const idempotency = new IdempotencyGuard({
     redis: redis.native,
@@ -624,13 +603,6 @@ export function getEnricherWorker(): EnricherWorker | undefined {
 // ─── Shutdown ──────────────────────────────────────────────────────────────
 
 export async function stopEnricherWorker(): Promise<void> {
-  logger?.info("shutdown initiated");
-  if (healthInterval) {
-    clearInterval(healthInterval);
-    healthInterval = null;
-  }
-  if (worker) await worker.stop();
-  if (sql) await sql.end();
-  if (redis) await redis.disconnect();
-  logger?.info("enricher stopped");
+  await shutdownWorker("enricher", { logger, timers: [healthInterval], worker, sql, redis });
+  healthInterval = null;
 }

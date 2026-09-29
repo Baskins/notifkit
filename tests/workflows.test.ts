@@ -24,7 +24,8 @@ const { mockDb, mockRedisNative, mockNotificationProducer, mockWorkflowProducer 
       // The ioredis client the worker actually receives.
       mockRedisNative: {
         zadd: vi.fn(),
-        eval: vi.fn(),
+        releaseLock: vi.fn().mockResolvedValue(1),
+        renewLock: vi.fn().mockResolvedValue(1),
         set: vi.fn().mockResolvedValue("OK"),
         del: vi.fn(),
         duplicate: vi.fn(),

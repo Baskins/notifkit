@@ -1,9 +1,9 @@
 import { loadEnv, parseConfig, baseConfigSchema } from "@/index.js";
-import { createLogger } from "@/index.js";
-import { RedisClient, type Redis } from "@/index.js";
+import type { Logger } from "@/index.js";
+import type { RedisClient, Redis } from "@/index.js";
 import {
-  StreamConsumer,
-  PendingMessageScanner,
+  type StreamConsumer,
+  type PendingMessageScanner,
   type StreamMessage,
   StreamProducer,
 } from "@/index.js";
@@ -18,8 +18,6 @@ import {
   type RenderedContent,
   PUBSUB_CHANNELS,
 } from "@/index.js";
-import { type StreamName } from "@/contracts/streams.js";
-import { createDatabase } from "@/db/index.js";
 import { upsertOutboxProviderIds } from "@/db/bulk.js";
 import { deliveryOutbox, scheduledPayloads } from "@/db/schema.js";
 import { sql as drizzleSql } from "drizzle-orm";
@@ -28,6 +26,13 @@ import { renderWithTemplate, TemplateCache } from "@/templates/index.js";
 import { transportRegistry } from "@/index.js";
 import { globalEmitter, getPriorityBucket, type WorkerOptions } from "@/shared/index.js";
 import { startHealthReporter, NonRetryableError } from "@/workers/index.js";
+import {
+  createPriorityProducers,
+  createStreamConsumer,
+  createWorkerRuntime,
+  shutdownWorker,
+  uniqueConsumerId,
+} from "@/workers/bootstrap.js";
 import { BatchProcessor, CircuitBreaker } from "@/shared/index.js";
 import { ProviderThrottle } from "./throttle.js";
 import { metrics } from "@/metrics/index.js";
@@ -41,7 +46,7 @@ const deliveryConfigSchema = baseConfigSchema.extend({});
 loadEnv();
 const config = parseConfig(deliveryConfigSchema, process.env);
 
-let logger: ReturnType<typeof createLogger>;
+let logger: Logger;
 let redis: RedisClient;
 let sql: any;
 let db: any;
@@ -875,27 +880,22 @@ export class DeliveryWorker extends BaseWorker {
 }
 
 export async function startDeliveryWorker() {
-  logger = createLogger({ name: "delivery", level: config.LOG_LEVEL });
-
-  redis = RedisClient.shared({ url: config.REDIS_URL, name: "delivery", logger });
-  const dbData = createDatabase({ url: config.DATABASE_URL, applicationName: "delivery", logger });
-  sql = dbData.sql;
-  db = dbData.db;
+  ({ logger, redis, sql, db } = createWorkerRuntime(config, "delivery"));
   // Delivery spends most of its time waiting on providers, so it needs far
   // more messages in flight than the CPU-bound stages do.
   const deliveryConcurrency = config.DELIVERY_CONCURRENCY ?? config.WORKER_CONCURRENCY;
-  const consumerId = `delivery-${process.env.HOSTNAME || process.pid}-${Math.random().toString(36).slice(2, 8)}`;
-  consumer = new StreamConsumer({
-    redis: redis.native,
-    stream: OUTBOUND_STREAMS as unknown as StreamName[],
-    group: CONSUMER_GROUPS.DELIVERY,
-    consumer: consumerId,
-    dlqStream: STREAMS.DEAD_LETTER,
-    batchSize: deliveryConcurrency,
-    bufferAcks: true,
-    coalesceMs: 2,
-    logger,
-  });
+  const consumerId = uniqueConsumerId("delivery");
+  ({ consumer, pendingScanner } = createStreamConsumer(
+    { redis, logger },
+    {
+      stream: OUTBOUND_STREAMS,
+      group: CONSUMER_GROUPS.DELIVERY,
+      consumer: consumerId,
+      batchSize: deliveryConcurrency,
+      bufferAcks: true,
+      coalesceMs: 2,
+    },
+  ));
 
   scheduledProducer = new StreamProducer({
     redis: redis.native,
@@ -903,23 +903,7 @@ export async function startDeliveryWorker() {
     logger,
   });
 
-  pendingScanner = new PendingMessageScanner({
-    redis: redis.native,
-    stream: OUTBOUND_STREAMS as unknown as StreamName[],
-    group: CONSUMER_GROUPS.DELIVERY,
-    consumer: consumerId,
-    logger,
-  });
-
-  enrichedProducers = {
-    critical: new StreamProducer({
-      redis: redis.native,
-      stream: STREAMS.ENRICHED_CRITICAL,
-      logger,
-    }),
-    normal: new StreamProducer({ redis: redis.native, stream: STREAMS.ENRICHED_NORMAL, logger }),
-    low: new StreamProducer({ redis: redis.native, stream: STREAMS.ENRICHED_LOW, logger }),
-  };
+  enrichedProducers = createPriorityProducers(redis.native, logger, "ENRICHED");
 
   const contactRepo = new ContactRepository(db);
   const templateCache = new TemplateCache(new TemplateRepository(db));
@@ -984,17 +968,14 @@ export function getDeliveryWorker(): DeliveryWorker | undefined {
 // ─── Shutdown ──────────────────────────────────────────────────────────────
 
 export async function stopDeliveryWorker(): Promise<void> {
-  logger?.info("shutdown initiated");
-  if (healthInterval) {
-    clearInterval(healthInterval);
-    healthInterval = null;
-  }
-  if (subscriber) {
-    subscriber.disconnect();
-    subscriber = null;
-  }
-  if (worker) await worker.stop();
-  if (sql) await sql.end();
-  if (redis) await redis.disconnect();
-  logger?.info("delivery stopped");
+  await shutdownWorker("delivery", {
+    logger,
+    timers: [healthInterval],
+    subscriber,
+    worker,
+    sql,
+    redis,
+  });
+  healthInterval = null;
+  subscriber = null;
 }

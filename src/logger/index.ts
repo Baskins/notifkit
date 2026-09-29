@@ -46,15 +46,3 @@ export function createLogger({ name, level = "info", pretty, context }: LoggerOp
 
   return pino(options);
 }
-
-export function withRequestId(logger: Logger, requestId: string): Logger {
-  return logger.child({ requestId });
-}
-
-export function withContext(logger: Logger, context: Record<string, unknown>): Logger {
-  return logger.child(context);
-}
-
-export function childLogger(logger: Logger, bindings: Record<string, unknown>): Logger {
-  return logger.child(bindings);
-}

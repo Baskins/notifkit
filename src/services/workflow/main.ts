@@ -1,17 +1,15 @@
 import { randomUUID } from "node:crypto";
 import { loadEnv, readBaseConfig } from "@/index.js";
-import { createLogger } from "@/index.js";
-import { RedisClient, type Redis } from "@/index.js";
+import type { Logger } from "@/index.js";
+import type { RedisClient, Redis } from "@/index.js";
 import {
-  StreamConsumer,
-  PendingMessageScanner,
+  type StreamConsumer,
+  type PendingMessageScanner,
   StreamProducer,
   type StreamMessage,
 } from "@/index.js";
 import { BaseWorker } from "@/index.js";
 import { STREAMS, CONSUMER_GROUPS, buildStreamEvent } from "@/index.js";
-import { type StreamName } from "@/contracts/streams.js";
-import { createDatabase } from "@/db/index.js";
 import {
   workflowInstances,
   workflowSteps,
@@ -26,13 +24,9 @@ import {
   type WorkflowContext,
   type WorkflowStepContext,
 } from "@/workflows/index.js";
-import {
-  type WorkerOptions,
-  LUA_SCHEDULER_POLL,
-  LUA_RELEASE_LOCK,
-  LUA_RENEW_LOCK,
-} from "@/shared/index.js";
+import { type WorkerOptions } from "@/shared/index.js";
 import { startHealthReporter } from "@/workers/index.js";
+import { createStreamConsumer, createWorkerRuntime, shutdownWorker } from "@/workers/bootstrap.js";
 
 /** How long a workflow instance lock is held before it self-expires. */
 const WORKFLOW_LOCK_TTL_SECONDS = 60;
@@ -43,7 +37,7 @@ const WORKFLOW_TIMER_VISIBILITY_MS = 60_000;
 
 loadEnv();
 const config = readBaseConfig();
-let logger: ReturnType<typeof createLogger>;
+let logger: Logger;
 let redis: RedisClient;
 let sql: any;
 let db: any;
@@ -202,19 +196,11 @@ export class WorkflowWorker extends BaseWorker {
     // Keep the lock alive while the handler runs; without this a handler that
     // outlives the TTL lets a second resume execute the same steps in parallel.
     const renewTimer = setInterval(() => {
-      const renewPromise =
-        typeof this.redisCli.renewLock === "function"
-          ? this.redisCli.renewLock(lockKey, lockToken, WORKFLOW_LOCK_TTL_SECONDS)
-          : this.redisCli.eval(
-              LUA_RENEW_LOCK,
-              1,
-              lockKey,
-              lockToken,
-              String(WORKFLOW_LOCK_TTL_SECONDS),
-            );
-      void renewPromise.catch((err: unknown) => {
-        this.logger.warn({ err, instanceId }, "failed to renew workflow lock");
-      });
+      void this.redisCli
+        .renewLock(lockKey, lockToken, WORKFLOW_LOCK_TTL_SECONDS)
+        .catch((err: unknown) => {
+          this.logger.warn({ err, instanceId }, "failed to renew workflow lock");
+        });
     }, WORKFLOW_LOCK_RENEW_MS);
 
     try {
@@ -449,11 +435,7 @@ export class WorkflowWorker extends BaseWorker {
     } finally {
       clearInterval(renewTimer);
       // Compare-and-delete: never release a lock a later process re-acquired.
-      if (typeof this.redisCli.releaseLock === "function") {
-        await this.redisCli.releaseLock(lockKey, lockToken);
-      } else {
-        await this.redisCli.eval(LUA_RELEASE_LOCK, 1, lockKey, lockToken);
-      }
+      await this.redisCli.releaseLock(lockKey, lockToken);
     }
 
     await Promise.all(publishPromises);
@@ -468,11 +450,7 @@ export function __injectForTests(r: any, d: any, wp: any, np: any) {
 }
 
 export async function startWorkflowWorker() {
-  logger = createLogger({ name: "workflow-worker", level: config.LOG_LEVEL });
-  redis = RedisClient.shared({ url: config.REDIS_URL, name: "workflow", logger });
-  const dbData = createDatabase({ url: config.DATABASE_URL, applicationName: "workflow", logger });
-  sql = dbData.sql;
-  db = dbData.db;
+  ({ logger, redis, sql, db } = createWorkerRuntime(config, "workflow", "workflow-worker"));
   notificationProducer = new StreamProducer({
     redis: redis.native,
     stream: STREAMS.INBOUND_NORMAL,
@@ -483,23 +461,15 @@ export async function startWorkflowWorker() {
     stream: STREAMS.WORKFLOW_INBOUND,
     logger,
   });
-  consumer = new StreamConsumer({
-    redis: redis.native,
-    stream: STREAMS.WORKFLOW_INBOUND as StreamName,
-    group: CONSUMER_GROUPS.WORKFLOW as any,
-    consumer: `workflow-${process.pid}`,
-    dlqStream: STREAMS.DEAD_LETTER,
-    batchSize: config.WORKER_CONCURRENCY,
-    logger,
-  });
-
-  pendingScanner = new PendingMessageScanner({
-    redis: redis.native,
-    stream: STREAMS.WORKFLOW_INBOUND as StreamName,
-    group: CONSUMER_GROUPS.WORKFLOW as any,
-    consumer: `workflow-${process.pid}`,
-    logger,
-  });
+  ({ consumer, pendingScanner } = createStreamConsumer(
+    { redis, logger },
+    {
+      stream: STREAMS.WORKFLOW_INBOUND,
+      group: CONSUMER_GROUPS.WORKFLOW,
+      consumer: `workflow-${process.pid}`,
+      batchSize: config.WORKER_CONCURRENCY,
+    },
+  ));
 
   worker = new WorkflowWorker({
     consumer,
@@ -517,23 +487,12 @@ export async function startWorkflowWorker() {
     void (async () => {
       try {
         const now = Date.now();
-        const tasks = (
-          typeof redis.native.schedulerPoll === "function"
-            ? await redis.native.schedulerPoll(
-                "notif:workflow:timers",
-                now,
-                100,
-                WORKFLOW_TIMER_VISIBILITY_MS,
-              )
-            : await redis.native.eval(
-                LUA_SCHEDULER_POLL,
-                1,
-                "notif:workflow:timers",
-                now,
-                100,
-                WORKFLOW_TIMER_VISIBILITY_MS,
-              )
-        ) as string[];
+        const tasks = await redis.native.schedulerPoll(
+          "notif:workflow:timers",
+          now,
+          100,
+          WORKFLOW_TIMER_VISIBILITY_MS,
+        );
 
         for (const taskStr of tasks) {
           const task = JSON.parse(taskStr);
@@ -637,12 +596,14 @@ export async function startWorkflowWorker() {
 }
 
 export async function stopWorkflowWorker(): Promise<void> {
-  logger?.info("shutdown initiated");
-  if (healthInterval) clearInterval(healthInterval);
-  if (pollInterval) clearInterval(pollInterval);
-  if (reaperInterval) clearInterval(reaperInterval);
-  if (worker) await worker.stop();
-  if (sql) await sql.end();
-  if (redis) await redis.disconnect();
-  logger?.info("workflow worker stopped");
+  await shutdownWorker("workflow worker", {
+    logger,
+    timers: [healthInterval, pollInterval, reaperInterval],
+    worker,
+    sql,
+    redis,
+  });
+  healthInterval = null;
+  pollInterval = null;
+  reaperInterval = null;
 }

@@ -42,7 +42,6 @@ describe("ApiRateLimiter (In-Memory Token Leasing)", () => {
     beforeEach(() => {
       mockRedis = {
         leaseApiRateLimit: vi.fn(),
-        eval: vi.fn(),
       };
       mockLogger = {
         warn: vi.fn(),
