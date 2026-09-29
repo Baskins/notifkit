@@ -990,16 +990,36 @@ describe("SDK client helpers", () => {
 });
 
 describe("admin dashboard", () => {
-  // Pointed at a port nothing listens on, so the static bundle is served.
-  let restore: string | undefined;
+  // Pointed at a port nothing listens on, so the static bundle is served. The
+  // bundle is a fixture: dashboard/dist is a gitignored build output, absent in
+  // CI and on a fresh checkout, and stale whenever it is present.
+  const saved: Record<string, string | undefined> = {};
+  let fixture = "";
   beforeAll(async () => {
-    restore = process.env.VITE_DEV_URL;
+    const { mkdtempSync, mkdirSync, writeFileSync } = await import("node:fs");
+    const { join } = await import("node:path");
+    const { tmpdir } = await import("node:os");
+    fixture = mkdtempSync(join(tmpdir(), "notifkit-dashboard-"));
+    mkdirSync(join(fixture, "assets"));
+    writeFileSync(
+      join(fixture, "index.html"),
+      '<!doctype html><div id="root" data-fixture="notifkit-test"></div>',
+    );
+    writeFileSync(join(fixture, "assets", "app-abc123.js"), "console.log(1)");
+    writeFileSync(join(fixture, "favicon.svg"), "<svg/>");
+
+    for (const k of ["VITE_DEV_URL", "NOTIFKIT_DASHBOARD_DIR"]) saved[k] = process.env[k];
     const { freePort } = await import("./support/pipeline.js");
     process.env.VITE_DEV_URL = `http://127.0.0.1:${await freePort()}`;
+    process.env.NOTIFKIT_DASHBOARD_DIR = fixture;
   });
-  afterAll(() => {
-    if (restore === undefined) delete process.env.VITE_DEV_URL;
-    else process.env.VITE_DEV_URL = restore;
+  afterAll(async () => {
+    for (const [k, v] of Object.entries(saved)) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+    const { rmSync } = await import("node:fs");
+    rmSync(fixture, { recursive: true, force: true });
   });
 
   const get = (path: string) => fetch(`${app.baseUrl}${path}`, { redirect: "manual" });
@@ -1013,13 +1033,11 @@ describe("admin dashboard", () => {
     expect(index.status).toBe(200);
     expect(index.headers.get("content-type")).toBe("text/html; charset=utf-8");
     expect(index.headers.get("cache-control")).toContain("must-revalidate");
-    expect(await index.text()).toContain('<div id="root"');
+    expect(await index.text()).toContain('data-fixture="notifkit-test"');
   });
 
   it("serves built assets with their type and a long cache lifetime", async () => {
-    const { readdirSync } = await import("node:fs");
-    const js = readdirSync("dashboard/dist/assets").find((f) => f.endsWith(".js"))!;
-    const res = await get(`/admin/assets/${js}`);
+    const res = await get("/admin/assets/app-abc123.js");
     expect(res.status).toBe(200);
     expect(res.headers.get("content-type")).toBe("application/javascript; charset=utf-8");
     expect(res.headers.get("cache-control")).toContain("immutable");
@@ -1029,7 +1047,7 @@ describe("admin dashboard", () => {
   it("falls back to the index for client-side routes", async () => {
     const res = await get("/admin/projects/123/logs");
     expect(res.status).toBe(200);
-    expect(await res.text()).toContain('<div id="root"');
+    expect(await res.text()).toContain('data-fixture="notifkit-test"');
   });
 
   it("never serves a file outside the bundle", async () => {

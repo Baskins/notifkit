@@ -1,7 +1,8 @@
 import { describe, it, expect, vi, beforeAll, afterAll } from "vitest";
-import { handleAdminRequest } from "@/services/api/admin-static.js";
-import { mkdirSync, writeFileSync, rmSync, existsSync } from "node:fs";
-import { resolve } from "node:path";
+import { handleAdminRequest, findDashboardDir } from "@/services/api/admin-static.js";
+import { mkdirSync, mkdtempSync, writeFileSync, rmSync, existsSync } from "node:fs";
+import { join, resolve } from "node:path";
+import { tmpdir } from "node:os";
 
 function createMockReq(url: string, method = "GET") {
   return {
@@ -92,5 +93,53 @@ describe("Admin Static Server", () => {
     const handled = await handleAdminRequest(req, res, url);
     expect(handled).toBe(true);
     expect(res.writeHead).toHaveBeenCalledWith(403, { "Content-Type": "text/plain" });
+  });
+});
+
+describe("findDashboardDir", () => {
+  // An installed copy: the bundle runs from node_modules/notifkit/dist, and the
+  // built dashboard ships beside it. The app itself runs from its own folder.
+  function installedPackage() {
+    const root = mkdtempSync(join(tmpdir(), "notifkit-dash-"));
+    const pkg = join(root, "node_modules", "notifkit");
+    mkdirSync(join(pkg, "dist"), { recursive: true });
+    mkdirSync(join(pkg, "dashboard", "dist"), { recursive: true });
+    writeFileSync(join(pkg, "package.json"), '{"name":"notifkit"}');
+    writeFileSync(join(pkg, "dashboard", "dist", "index.html"), "<html></html>");
+    const app = join(root, "app");
+    mkdirSync(app);
+    return { root, pkg, app };
+  }
+
+  it("finds the dashboard shipped in the package when the app runs from another directory", () => {
+    const { root, pkg, app } = installedPackage();
+    try {
+      expect(findDashboardDir(join(pkg, "dist"), app, {})).toBe(join(pkg, "dashboard", "dist"));
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("uses NOTIFKIT_DASHBOARD_DIR over the shipped build when it holds an index", () => {
+    const { root, pkg, app } = installedPackage();
+    const custom = join(root, "custom");
+    mkdirSync(custom);
+    writeFileSync(join(custom, "index.html"), "<html></html>");
+    try {
+      expect(findDashboardDir(join(pkg, "dist"), app, { NOTIFKIT_DASHBOARD_DIR: custom })).toBe(
+        custom,
+      );
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("returns null when no build exists anywhere", () => {
+    const root = mkdtempSync(join(tmpdir(), "notifkit-dash-"));
+    try {
+      expect(findDashboardDir(root, root, {})).toBeNull();
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 });

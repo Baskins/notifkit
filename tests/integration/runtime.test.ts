@@ -2,7 +2,8 @@ import { describe, it, expect, afterEach } from "vitest";
 import { spawn } from "node:child_process";
 import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
+import { pathToFileURL } from "node:url";
 import { randomUUID } from "node:crypto";
 import { z } from "zod";
 import {
@@ -134,8 +135,16 @@ describe("process lifecycle", () => {
   it.skipIf(process.platform === "win32")(
     "shuts the server down gracefully on SIGTERM and exits cleanly",
     async () => {
-      const script = `
-        import { NotifkitServer } from "./src/server.ts";
+      // A real module file run by this node binary, not `npx tsx --eval`: tsx
+      // compiles an eval snippet as CommonJS, where the top-level await below
+      // does not run, so the child exited without ever starting. And a signal
+      // sent to an npx wrapper need not reach the server it launched.
+      const dir = mkdtempSync(join(tmpdir(), "nk-lifecycle-"));
+      const script = join(dir, "server.mts");
+      writeFileSync(
+        script,
+        `
+        import { NotifkitServer } from ${JSON.stringify(pathToFileURL(resolve("src/server.ts")).href)};
         const server = new NotifkitServer({
           services: ["enricher", "engine", "delivery"],
           redisUrl: process.env.REDIS_URL, databaseUrl: process.env.DATABASE_URL,
@@ -143,23 +152,37 @@ describe("process lifecycle", () => {
         });
         await server.start();
         console.log("READY");
-      `;
-      const child = spawn("npx", ["--no-install", "tsx", "--eval", script], {
+      `,
+      );
+      const child = spawn(process.execPath, ["--import", "tsx", script], {
         env: { ...process.env, REDIS_URL: infra.redisUrl, DATABASE_URL: infra.dbUrl },
         stdio: ["ignore", "pipe", "pipe"],
       });
       let out = "";
+      let err = "";
       child.stdout.on("data", (c) => (out += c));
+      child.stderr.on("data", (c) => (err += c));
       const exited = new Promise<number | null>((r) => child.on("exit", (code) => r(code)));
 
-      await waitFor("server ready", () => out.includes("READY"), 60_000);
-      await waitFor(
-        "workers reporting",
-        async () => (await infra.redis.exists("notif:health:engine")) === 1,
-        20_000,
-      );
-      child.kill("SIGTERM");
-      expect(await exited).toBe(0);
+      try {
+        // Stop waiting as soon as the child dies, and say why it did.
+        await waitFor(
+          "server ready",
+          () => out.includes("READY") || child.exitCode !== null,
+          60_000,
+        );
+        expect(out, `server never started; stderr:\n${err}`).toContain("READY");
+        await waitFor(
+          "workers reporting",
+          async () => (await infra.redis.exists("notif:health:engine")) === 1,
+          20_000,
+        );
+        child.kill("SIGTERM");
+        expect(await exited, `stderr:\n${err}`).toBe(0);
+      } finally {
+        child.kill("SIGKILL");
+        rmSync(dir, { recursive: true, force: true });
+      }
     },
     90_000,
   );

@@ -1,6 +1,7 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
-import { resolve, extname, join, relative, isAbsolute } from "node:path";
+import { resolve, extname, join, relative, isAbsolute, dirname } from "node:path";
 import { existsSync, statSync, createReadStream } from "node:fs";
+import { fileURLToPath } from "node:url";
 import { request as httpRequest } from "node:http";
 
 const MIME_TYPES: Record<string, string> = {
@@ -23,18 +24,46 @@ const MIME_TYPES: Record<string, string> = {
   ".map": "application/json; charset=utf-8",
 };
 
-// Possible output directories where built dashboard static files might reside
-const POSSIBLE_DASHBOARD_DIRS = [
-  resolve(process.cwd(), "dashboard", "dist"),
-  resolve(process.cwd(), "dashboard", "out"),
-  resolve(process.cwd(), "dist", "admin"),
-  resolve(process.cwd(), "dist", "dashboard"),
+// Where a built dashboard may sit, relative to a base directory.
+const DASHBOARD_SUBDIRS = [
+  ["dashboard", "dist"],
+  ["dashboard", "out"],
+  ["dist", "admin"],
+  ["dist", "dashboard"],
 ];
 
-function getDashboardDir(): string | null {
-  for (const dir of POSSIBLE_DASHBOARD_DIRS) {
-    if (existsSync(dir) && existsSync(join(dir, "index.html"))) {
-      return dir;
+const MODULE_DIR = dirname(fileURLToPath(import.meta.url));
+
+/** The nearest ancestor of `dir` holding a package.json: notifkit's own root. */
+function packageRoot(dir: string): string | null {
+  for (let d = dir; ; d = dirname(d)) {
+    if (existsSync(join(d, "package.json"))) return d;
+    if (dirname(d) === d) return null;
+  }
+}
+
+/**
+ * Locates the built dashboard.
+ *
+ * The package ships `dashboard/dist`, so it is looked for beside this module
+ * first. Resolving it from the working directory alone found it only when the
+ * process was started from a notifkit checkout; installed as a dependency, the
+ * working directory is the host app's and /admin reported "not built".
+ * `NOTIFKIT_DASHBOARD_DIR` overrides both.
+ */
+export function findDashboardDir(
+  moduleDir: string = MODULE_DIR,
+  cwd: string = process.cwd(),
+  env: Record<string, string | undefined> = process.env,
+): string | null {
+  const override = env.NOTIFKIT_DASHBOARD_DIR;
+  if (override && existsSync(join(override, "index.html"))) return resolve(override);
+
+  const bases = [packageRoot(moduleDir), cwd].filter((b): b is string => b !== null);
+  for (const base of bases) {
+    for (const sub of DASHBOARD_SUBDIRS) {
+      const dir = resolve(base, ...sub);
+      if (existsSync(join(dir, "index.html"))) return dir;
     }
   }
   return null;
@@ -111,7 +140,7 @@ export async function handleAdminRequest(
     }
   }
 
-  const dashboardDir = getDashboardDir();
+  const dashboardDir = findDashboardDir();
   if (!dashboardDir) {
     // If dashboard build not found, return friendly message
     res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
