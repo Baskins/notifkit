@@ -149,7 +149,7 @@ describe("Crash Testing (Chaos Monkey)", () => {
     // So wait 180s.
     const startTime = Date.now();
     while (deliveredCount + failedCount < NUM_MESSAGES) {
-      if (Date.now() - startTime > 180_000) {
+      if (Date.now() - startTime > 150_000) {
         throw new Error(
           `Timeout waiting for deliveries. Delivered: ${deliveredCount}, Failed: ${failedCount}, Expected: ${NUM_MESSAGES}`,
         );

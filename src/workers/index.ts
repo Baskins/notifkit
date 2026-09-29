@@ -62,6 +62,7 @@ export abstract class BaseWorker {
   private lastProcessedAt: string | null = null;
   private lastErrorAt: string | null = null;
   private recoveryTimer: ReturnType<typeof setInterval> | null = null;
+  private recovering = false;
   private lastPendingCount: number | null = null;
   private readonly active = new Set<Promise<void>>();
   private readonly semaphore: AsyncSemaphore;
@@ -307,14 +308,28 @@ export abstract class BaseWorker {
     }
   }
 
+  /**
+   * `recoveryIntervalMs` is how long an entry must sit idle before it is
+   * claimed, not how often to look. Scanning only once per interval, timed from
+   * this worker's start, meant a worker restarted more often than that (a crash
+   * loop, an eager autoscaler) never scanned at all, and whatever its
+   * predecessors held stayed pending for good. So scan on start and then
+   * several times per interval; the idle threshold alone decides what is taken.
+   */
   private startRecoveryLoop(): void {
-    this.recoveryTimer = setInterval(() => {
-      if (this.state === "running") {
-        this.recover().catch((err: unknown) => {
+    const scan = () => {
+      if (this.state !== "running" || this.recovering) return;
+      this.recovering = true;
+      this.recover()
+        .catch((err: unknown) => {
           this.logger.error({ err }, "recovery loop error");
+        })
+        .finally(() => {
+          this.recovering = false;
         });
-      }
-    }, this.recoveryIntervalMs);
+    };
+    scan();
+    this.recoveryTimer = setInterval(scan, Math.max(Math.floor(this.recoveryIntervalMs / 4), 10));
   }
 
   private stopRecoveryLoop(): void {

@@ -515,6 +515,30 @@ describe("BaseWorker", () => {
     expect(await pending()).toBe(0);
   });
 
+  it("recovers a crashed consumer's message even when no worker outlives one recovery interval", async () => {
+    // A worker that crashed mid-message leaves its entry pending under a
+    // consumer name nobody will read again. Its replacements restart more often
+    // than the recovery interval (a crash loop, an aggressive autoscaler), so a
+    // scan timed from each worker's start never fires.
+    await infra.redis.xgroup("CREATE", STREAM, GROUP, "0", "MKSTREAM");
+    await publish(1);
+    await infra.redis.xreadgroup("GROUP", GROUP, "crashed", "COUNT", 1, "STREAMS", STREAM, ">");
+
+    const processed: number[] = [];
+    const deadline = Date.now() + 5_000;
+    while (processed.length === 0 && Date.now() < deadline) {
+      const w = worker(async (msg) => void processed.push((msg.event.payload as any).n), {
+        recoveryIntervalMs: 400,
+      });
+      await w.start();
+      await settle(250);
+      await w.stop();
+    }
+
+    expect(processed).toEqual([1]);
+    expect(await pending()).toBe(0);
+  });
+
   it("recover() reports the pending count through health()", async () => {
     const w = worker(async () => {});
     expect(w.health().pendingCount).toBeNull();
