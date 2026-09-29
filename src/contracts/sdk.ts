@@ -110,12 +110,12 @@ export const TemplateSchema = z.object({
   content: z.record(z.string(), z.unknown()),
   aiPrompts: z.record(z.string(), z.string()).optional(),
 });
-export type TemplateInput = z.infer<typeof TemplateSchema>;
+export type TemplateInput = z.input<typeof TemplateSchema>;
 
 export const SyncTemplatesSchema = z.object({
   templates: z.array(TemplateSchema).min(1),
 });
-export type SyncTemplatesInput = z.infer<typeof SyncTemplatesSchema>;
+export type SyncTemplatesInput = z.input<typeof SyncTemplatesSchema>;
 
 // ─── notify() ─────────────────────────────────────────────────────────────────
 
@@ -216,7 +216,7 @@ export const TriggerWorkflowSchema = z.object({
   input: z.record(z.string(), z.unknown()).optional(),
   user: z.union([z.string().min(1), InlineUserSchema]).optional(),
 });
-export type TriggerWorkflowInput = z.infer<typeof TriggerWorkflowSchema>;
+export type TriggerWorkflowInput = z.input<typeof TriggerWorkflowSchema>;
 
 // ─── Events ───────────────────────────────────────────────────────────────────
 
@@ -241,6 +241,12 @@ export const WorkflowStepSchema = z.discriminatedUnion("action", [
     options: z
       .object({
         timeout: z.string().optional(), // e.g. "24h"
+        /**
+         * Fields the event must carry to wake this instance, e.g.
+         * `{ userId: "u1" }`. Without it any event of that name in the project
+         * wakes every instance waiting on it.
+         */
+        match: z.record(z.string(), z.unknown()).optional(),
       })
       .optional(),
   }),
@@ -251,7 +257,7 @@ export const CreateWorkflowSchema = z.object({
   name: z.string().min(1),
   steps: z.array(WorkflowStepSchema).min(1),
 });
-export type CreateWorkflowInput = z.infer<typeof CreateWorkflowSchema>;
+export type CreateWorkflowInput = z.input<typeof CreateWorkflowSchema>;
 
 // ─── Projects ─────────────────────────────────────────────────────────────────
 
@@ -291,7 +297,8 @@ export interface UserResponse extends UserProfileResponse {
 
 export interface UserDetailResponse extends UserResponse {
   contacts: UserContactResponse[];
-  recentLogs?: unknown[];
+  /** The 50 most recent delivery-log rows for this user's addresses. */
+  logs: NotificationLogRecord[];
 }
 
 export interface WorkflowDefinitionRecord {
@@ -302,30 +309,53 @@ export interface WorkflowDefinitionRecord {
   updatedAt?: string;
 }
 
-export interface WorkflowInstanceRecord {
+export interface WorkflowStepRecord {
   id: string;
-  name: string;
-  status: string;
-  currentStepIndex: number;
-  input?: Record<string, unknown>;
-  output?: Record<string, unknown>;
+  instanceId: string;
+  stepIndex: string;
+  action: "notify" | "wait" | "waitForEvent" | "run" | string;
+  output: unknown;
+  error: string | null;
   createdAt: string;
-  updatedAt: string;
 }
 
+export interface WorkflowWaiterRecord {
+  id: string;
+  instanceId: string;
+  eventName: string;
+  matchCriteria: Record<string, unknown>;
+  expiresAt: string;
+  createdAt: string;
+}
+
+export interface WorkflowInstanceRecord {
+  id: string;
+  projectId: string;
+  name: string;
+  status: "pending" | "running" | "completed" | "failed" | "canceled";
+  input?: Record<string, unknown> | null;
+  createdAt: string;
+  updatedAt: string;
+  steps: WorkflowStepRecord[];
+  waiters: WorkflowWaiterRecord[];
+}
+
+/** One row of the delivery log, as the API returns it. */
 export interface NotificationLogRecord {
   id: string;
-  notificationId: string;
-  taskId?: string;
+  projectId: string;
+  taskId: string;
+  providerMessageId: string | null;
+  templateId: string | null;
+  workflowInstanceId: string | null;
   channel: string;
-  target?: string;
+  attempt: number;
+  /** `dispatched`, `attempt`, or an engagement event such as `opened`. */
+  kind: string;
   status: string;
-  templateId?: string;
-  campaign?: string;
-  createdAt: string;
-  dispatchedAt?: string;
-  error?: string;
-  metadata?: Record<string, unknown>;
+  campaignId: string | null;
+  metadata: Record<string, unknown> | null;
+  timestamp: string;
 }
 
 export interface TemplateRecordResponse {
@@ -338,9 +368,12 @@ export interface TemplateRecordResponse {
 
 export interface SuppressionRecord {
   id: string;
+  projectId: string;
   channel: string;
   target: string;
   reason: string;
+  source: string | null;
+  taskId: string | null;
   createdAt: string;
 }
 
@@ -353,30 +386,45 @@ export interface ProjectRecord {
   createdAt: string;
 }
 
+/** A key as listed: the secret itself is only ever returned once, on creation. */
 export interface ProjectKeyRecord {
   id: string;
-  apiKey: string;
-  role: string;
+  role: "admin" | "read_only";
   createdAt: string;
 }
 
+export interface CreatedProjectKeyRecord {
+  id: string;
+  apiKey: string;
+  role: "admin" | "read_only";
+}
+
 export interface SystemHealthRecord {
-  status: string;
-  timestamp: string;
-  redis?: { status: string };
-  db?: { status: string };
-  workers?: Record<string, unknown>;
+  status: "healthy" | "degraded";
+  redis: { ok: boolean; latencyMs: number };
+  db: { ok: boolean; latencyMs: number };
+  /** Each worker's last heartbeat, or `{ status: "unknown" }` when none arrived. */
+  workers: Record<string, Record<string, unknown>>;
 }
 
 export interface SystemMetricsRecord {
-  queues: Record<string, number>;
-  throughput?: Record<string, unknown>;
+  /** Unconsumed backlog per stream. Empty for project-scoped callers. */
+  streams: Record<string, number>;
+  deliveryStats: {
+    total: number;
+    delivered: number;
+    failed: number;
+    successRate: number;
+  };
 }
 
 export interface DLQMessageRecord {
   id: string;
-  stream: string;
+  eventType: string;
   payload: Record<string, unknown>;
-  error?: string;
+  /** Why the message was dead-lettered. */
+  error: string;
   timestamp: string;
+  /** The stream it failed on, where a replay puts it back. */
+  originalStream?: string;
 }

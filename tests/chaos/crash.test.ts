@@ -26,23 +26,21 @@ describe("Crash Testing (Chaos Monkey)", () => {
 
   const spawnWorker = (type: string, id: string) => {
     logger.info(`Spawning worker: ${type} (${id})`);
-    const isWin = process.platform === "win32";
-    const cp = spawn(
-      isWin ? "cmd.exe" : "npx",
-      isWin
-        ? ["/c", "npx", "--no-install", "tsx", "tests/chaos/worker-runner.ts"]
-        : ["--no-install", "tsx", "tests/chaos/worker-runner.ts"],
-      {
-        env: {
-          ...process.env,
-          WORKER_TYPE: type,
-          DATABASE_URL: dbUrl,
-          REDIS_URL: redisUrl,
-          LOG_LEVEL: "silent",
-        },
-        stdio: "ignore", // ignore output to keep logs clean
+    // The worker is this node binary's own child, with tsx loaded as an import
+    // hook. Launched through `cmd /c npx tsx` (or `npx tsx`) instead, a kill
+    // reached only the wrapper: on Windows the worker itself survived every
+    // "crash", so no crash was ever tested, and each respawn leaked another
+    // worker until the machine ran out of memory.
+    const cp = spawn(process.execPath, ["--import", "tsx", "tests/chaos/worker-runner.ts"], {
+      env: {
+        ...process.env,
+        WORKER_TYPE: type,
+        DATABASE_URL: dbUrl,
+        REDIS_URL: redisUrl,
+        LOG_LEVEL: "silent",
       },
-    );
+      stdio: "ignore", // ignore output to keep logs clean
+    });
 
     cp.on("exit", (code, signal) => {
       logger.info(`Worker ${type} (${id}) exited with signal ${signal} (code ${code})`);

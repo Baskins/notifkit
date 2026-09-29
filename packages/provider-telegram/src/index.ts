@@ -55,7 +55,12 @@ export class TelegramTransport implements Transport {
     const subject = content.subject;
     // Telegram messages have no subject line of their own, so a template
     // that renders one gets folded into the first line rather than dropped.
-    const text = subject ? `${subject}\n\n${body}` : body;
+    // Either part may be missing: a subject-only template must not send the
+    // word "undefined" underneath it.
+    const text = [subject, body].filter((part) => typeof part === "string" && part).join("\n\n");
+    if (!text) {
+      return { success: false, error: "No message text on task" };
+    }
     const parseMode = typeof content.parseMode === "string" ? content.parseMode : this.parseMode;
 
     try {

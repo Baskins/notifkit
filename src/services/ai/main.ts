@@ -1,4 +1,3 @@
-import { randomUUID } from "node:crypto";
 import { loadEnv, readBaseConfig } from "@/index.js";
 import type { Logger } from "@/index.js";
 import type { RedisClient, Redis } from "@/index.js";
@@ -31,6 +30,7 @@ import {
   createStreamConsumer,
   createWorkerRuntime,
   shutdownWorker,
+  uniqueConsumerId,
 } from "@/workers/bootstrap.js";
 
 // ─── Bootstrap ─────────────────────────────────────────────────────────────
@@ -128,11 +128,22 @@ export class AiWorker extends BaseWorker {
 
     const pending = payloadResult.data as NotificationAiPendingPayload;
 
-    // Idempotency
-    const idempotencyKey = `${pending.enrichedEventId}:${pending.recipientId}:${pending.channel}:ai`;
+    // Stable across replays: the engine's task id when it sent one. A fresh id
+    // per attempt made a replay after a crash a second, unrelated task that
+    // delivery's lease could not recognise — the recipient got it twice.
+    const taskId =
+      pending.taskId ?? `${pending.enrichedEventId}:${pending.recipientId}:${pending.channel}`;
+
+    // Idempotency. The lease has to outlast every generation this message may
+    // run, or a second worker takes it over mid-call and bills the prompts again.
+    const idempotencyKey = `${taskId}:ai`;
+    const aiConfig = getAiConfig();
+    const maxPrompts = aiConfig.maxPromptsPerNotification ?? AI_DEFAULTS.maxPromptsPerNotification;
+    const leaseSeconds =
+      Math.ceil(((aiConfig.timeoutMs ?? AI_DEFAULTS.timeoutMs) * maxPrompts) / 1000) + 30;
     const lease = this.idempotency.acquireLease
-      ? await this.idempotency.acquireLease(idempotencyKey, 30)
-      : (await this.idempotency.checkAndMark(idempotencyKey, 30))
+      ? await this.idempotency.acquireLease(idempotencyKey, leaseSeconds)
+      : (await this.idempotency.checkAndMark(idempotencyKey, leaseSeconds))
         ? "acquired"
         : "locked";
 
@@ -155,8 +166,6 @@ export class AiWorker extends BaseWorker {
       // Execute AI prompts. Each key is a separate billed model call, so the
       // count is capped rather than being driven by whatever the caller sent.
       const promptEntries = Object.entries(pending.aiPrompts);
-      const maxPrompts =
-        getAiConfig().maxPromptsPerNotification ?? AI_DEFAULTS.maxPromptsPerNotification;
       if (promptEntries.length > maxPrompts) {
         this.logger.warn(
           { messageId: message.id, requested: promptEntries.length, maxPrompts },
@@ -178,9 +187,9 @@ export class AiWorker extends BaseWorker {
 
       const rendered = renderWithTemplate(dbTemplate, finalVars);
 
-      const taskId = randomUUID();
       const destination =
-        pending.channel === "email"
+        pending.destination ??
+        (pending.channel === "email"
           ? pending.recipient.email
           : pending.channel === "sms" || pending.channel === "whatsapp"
             ? pending.recipient.phone
@@ -194,7 +203,7 @@ export class AiWorker extends BaseWorker {
                     ? pending.recipient.slack
                     : pending.channel === "push"
                       ? (pending.recipient.pushTokens?.[0] ?? pending.recipient.pushToken)
-                      : undefined;
+                      : undefined);
       const resolvedDestination =
         destination ?? (pending.channel === "push" ? undefined : pending.recipientId);
 
@@ -214,8 +223,11 @@ export class AiWorker extends BaseWorker {
         deliveryOptions: {
           maxAttempts: 3,
           timeoutMs: 10_000,
+          ...(pending.deliveryHeaders ? { headers: pending.deliveryHeaders } : {}),
         },
         fallbackChain: pending.fallbackChain,
+        campaignId: pending.campaignId,
+        workflowInstanceId: pending.workflowInstanceId,
       };
 
       const envelope = buildStreamEvent(
@@ -230,12 +242,15 @@ export class AiWorker extends BaseWorker {
       const scheduledAt = pending.scheduledAt ? new Date(pending.scheduledAt).getTime() : now;
 
       if (scheduledAt > now) {
-        await this.db.insert(scheduledPayloads).values({
-          taskId,
-          // The send time rides in the payload so the scheduler can re-queue
-          // this from Postgres if Redis loses its data.
-          payload: { ...taskPayload, scheduledAt: pending.scheduledAt },
-        });
+        await this.db
+          .insert(scheduledPayloads)
+          .values({
+            taskId,
+            // The send time rides in the payload so the scheduler can re-queue
+            // this from Postgres if Redis loses its data.
+            payload: { ...taskPayload, scheduledAt: pending.scheduledAt },
+          })
+          .onConflictDoNothing();
 
         const scheduledEnvelope = buildStreamEvent(
           "notification.scheduled",
@@ -305,7 +320,7 @@ export async function startAiWorker() {
     {
       stream: STREAMS.AI_PENDING,
       group: CONSUMER_GROUPS.AI,
-      consumer: `ai-${process.pid}`,
+      consumer: uniqueConsumerId("ai"),
       batchSize: config.WORKER_CONCURRENCY,
     },
   ));

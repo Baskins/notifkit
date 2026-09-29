@@ -10,6 +10,12 @@ export interface DeliveryResult {
   providerMessageId?: string;
   invalidToken?: boolean;
   error?: string;
+  /**
+   * `false` marks a failure another attempt cannot fix — a malformed address,
+   * a rejected sender. Anything else (an outage, a timeout, a 5xx) is retried
+   * up to the task's `maxAttempts`.
+   */
+  retryable?: boolean;
 }
 
 export interface WebhookEvent {

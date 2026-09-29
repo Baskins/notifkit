@@ -427,7 +427,11 @@ describe("API operational handlers", () => {
       );
 
       expect(res.statusCode).toBe(200);
-      expect(parse(res)).toEqual({ success: true, replayedId: "1-0" });
+      expect(parse(res)).toEqual({
+        success: true,
+        replayedId: "1-0",
+        stream: STREAMS.INBOUND_CRITICAL,
+      });
       expect(deps.redis.native.xadd).toHaveBeenCalledWith(
         STREAMS.INBOUND_CRITICAL,
         "*",
@@ -534,10 +538,11 @@ describe("API operational handlers", () => {
 
     it("cancelWorkflow returns 204 once the instance is canceled", async () => {
       const res = createMockRes();
-      await handlers.cancelWorkflow(createMockReq(), res, ctx({ params: { id: "wf_1" } }));
+      const id = "33333333-3333-4333-8333-333333333333";
+      await handlers.cancelWorkflow(createMockReq(), res, ctx({ params: { id } }));
 
       expect(res.statusCode).toBe(204);
-      expect(deps.workflowRepo.cancelInstance).toHaveBeenCalledWith("proj_1", "wf_1");
+      expect(deps.workflowRepo.cancelInstance).toHaveBeenCalledWith("proj_1", id);
     });
 
     it("cancelWorkflow 400s when the instance cannot be canceled", async () => {

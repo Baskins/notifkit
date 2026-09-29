@@ -179,7 +179,12 @@ describe("BaseWorker Retry and DLQ Logic", () => {
 
     await (worker as any).processWithTracking(msg);
 
-    expect(mockConsumer.nack).toHaveBeenCalledWith("msg-1", msg.event, undefined);
+    expect(mockConsumer.nack).toHaveBeenCalledWith(
+      "msg-1",
+      msg.event,
+      undefined,
+      expect.stringContaining("max retries exceeded"),
+    );
   });
 
   it("immediately moves to DLQ on attempt 1 when process throws NonRetryableError", async () => {
@@ -211,7 +216,12 @@ describe("BaseWorker Retry and DLQ Logic", () => {
 
     await (worker as any).processWithTracking(msg);
 
-    expect(mockConsumer.nack).toHaveBeenCalledWith("msg-perm-1", msg.event, undefined);
+    expect(mockConsumer.nack).toHaveBeenCalledWith(
+      "msg-perm-1",
+      msg.event,
+      undefined,
+      "fatal: recipient account terminated",
+    );
   });
 
   it("processes successfully without touching Redis retry keys on happy path", async () => {
@@ -307,7 +317,7 @@ describe("BaseWorker Retry and DLQ Logic", () => {
       });
 
       await expect(worker.processInline(inlineEvent)).resolves.toBeUndefined();
-      expect(mockConsumer.deadLetter).toHaveBeenCalledWith(inlineEvent);
+      expect(mockConsumer.deadLetter).toHaveBeenCalledWith(inlineEvent, expect.any(String));
       expect(mockConsumer.nack).not.toHaveBeenCalled();
     });
 
@@ -1132,7 +1142,7 @@ describe("DeliveryWorker", () => {
     );
   });
 
-  it("handles channel fallback by publishing to the next channel in the fallbackChain if all providers fail", async () => {
+  it("handles channel fallback by publishing to the next channel in the fallbackChain once its attempts are spent", async () => {
     const failingTransport = { send: vi.fn().mockRejectedValue(new Error("Fatal Error")) };
     mockTransportRegistry.getAll.mockReturnValue([failingTransport]);
 
@@ -1151,6 +1161,7 @@ describe("DeliveryWorker", () => {
           channel: "email",
           priority: "normal",
           deliveryOptions: {},
+          deliveryAttemptCount: 2, // the last of the default 3
           fallbackChain: ["sms", "push"], // Fallback chain provided
           recipient: {
             id: "usr-2",
@@ -1378,7 +1389,9 @@ describe("DeliveryWorker", () => {
       { send: vi.fn().mockResolvedValue({ success: false, error: "mailbox full" }) },
     ]);
 
-    await expect(worker.process(dispatched() as any)).rejects.toThrow("mailbox full");
+    await expect(worker.process(dispatched({ deliveryAttemptCount: 2 }) as any)).rejects.toThrow(
+      "mailbox full",
+    );
     expect(mockGlobalEmitter.emit).toHaveBeenCalledWith(
       "delivery:failed",
       "123e4567-e89b-12d3-a456-426614174001",
@@ -1393,7 +1406,9 @@ describe("DeliveryWorker", () => {
       { send: vi.fn().mockRejectedValue(new Error("smtp down")) },
     ]);
 
-    await expect(worker.process(dispatched() as any)).rejects.toThrow("smtp down");
+    await expect(worker.process(dispatched({ deliveryAttemptCount: 2 }) as any)).rejects.toThrow(
+      "smtp down",
+    );
     expect(worker["idempotency"].unmark).toHaveBeenCalledWith(
       "123e4567-e89b-12d3-a456-426614174001",
     );
@@ -1487,6 +1502,9 @@ describe("DeliveryWorker", () => {
 
   describe("provider rate limiting", () => {
     const limitedTransport = (send: any) => ({ send, limits: { limit: 5, windowSeconds: 60 } });
+    /** The payload parked in Postgres, which is what the scheduler releases. */
+    const parkedPayload = () =>
+      (worker as any).db.insert.mock.results[0].value.values.mock.calls[0][0].payload;
 
     it("reschedules the task instead of sending when the provider limit is hit", async () => {
       const send = vi.fn();
@@ -1501,7 +1519,7 @@ describe("DeliveryWorker", () => {
       const envelope = mockScheduledProducer.publish.mock.calls[0]![0];
       expect(envelope.type).toBe("notification.scheduled");
       expect(new Date(envelope.payload.scheduledAt).getTime()).toBeGreaterThan(Date.now());
-      expect(envelope.payload.throttleAttemptCount).toBe(1);
+      expect(parkedPayload().throttleAttemptCount).toBe(1);
     });
 
     it("counts each throttled attempt so the retries cannot loop forever", async () => {
@@ -1510,7 +1528,7 @@ describe("DeliveryWorker", () => {
 
       await worker.process(dispatched({ throttleAttemptCount: 2 }) as any);
 
-      expect(mockScheduledProducer.publish.mock.calls[0]![0].payload.throttleAttemptCount).toBe(3);
+      expect(parkedPayload().throttleAttemptCount).toBe(3);
     });
 
     it("gives up once the throttled retries exceed maxAttempts", async () => {
@@ -1629,9 +1647,9 @@ describe("DeliveryWorker", () => {
   // ── Circuit breaker ───────────────────────────────────────────────────────
 
   /**
-   * The worker keys one breaker per `${channel}:${transport.constructor.name}`,
-   * so these transports are real classes. Two object literals would both report
-   * the name "Object" and quietly share a single breaker.
+   * The worker keys one breaker per provider: its channel and class name,
+   * numbered when a channel has two of one class. These transports are real
+   * classes so the keys read the way production ones do.
    */
   describe("circuit breaker", () => {
     class FlakyTransport {
@@ -1663,16 +1681,36 @@ describe("DeliveryWorker", () => {
       expect(flaky.send).toHaveBeenCalledTimes(5);
     });
 
-    it("reports an open breaker as a delivery failure instead of letting it escape", async () => {
+    it("parks a task an open breaker turned away for a later attempt", async () => {
+      const flaky = new FlakyTransport();
+      mockTransportRegistry.getAll.mockReturnValue([flaky]);
+
+      for (let i = 0; i < 5; i++) await attempt(dispatched());
+      mockScheduledProducer.publish.mockClear();
+      const err = await attempt(dispatched());
+
+      // An open circuit says the provider is down, not that the message is bad.
+      expect(err).toBeUndefined();
+      expect(flaky.send).toHaveBeenCalledTimes(5);
+      expect(mockScheduledProducer.publish).toHaveBeenCalledTimes(1);
+      expect(mockGlobalEmitter.emit).not.toHaveBeenCalledWith(
+        "delivery:failed",
+        expect.anything(),
+        "Circuit breaker is OPEN",
+        expect.anything(),
+        expect.anything(),
+      );
+    });
+
+    it("reports an open breaker on a task's last attempt as a delivery failure", async () => {
       mockTransportRegistry.getAll.mockReturnValue([new FlakyTransport()]);
 
       for (let i = 0; i < 5; i++) await attempt(dispatched());
-      const err = await attempt(dispatched());
+      const err = await attempt(dispatched({ deliveryAttemptCount: 2 }));
 
-      // A short-circuit is still a delivery failure: it must reach the emitter
-      // and come back as NonRetryableError, or the task retries forever against
-      // a provider the worker has already given up on.
-      expect(err).toBeInstanceOf(Error);
+      // Out of attempts, a short-circuit is a delivery failure like any other:
+      // it must reach the emitter and come back as NonRetryableError.
+      expect(err).toBeInstanceOf(NonRetryableError);
       expect((err as Error).message).toBe("Circuit breaker is OPEN");
       expect(mockGlobalEmitter.emit).toHaveBeenLastCalledWith(
         "delivery:failed",
@@ -1766,6 +1804,9 @@ describe("DeliveryWorker", () => {
    * a retryable throw would send an already-exhausted task around again.
    */
   describe("fallback chain exhaustion", () => {
+    /** A task on the last of its attempts, so a failure is final. */
+    const lastAttempt = (payload: Record<string, unknown> = {}) =>
+      dispatched({ deliveryAttemptCount: 2, ...payload });
     const allProvidersFail = () =>
       mockTransportRegistry.getAll.mockReturnValue([
         { send: vi.fn().mockRejectedValue(new Error("Provider down")) },
@@ -1774,7 +1815,7 @@ describe("DeliveryWorker", () => {
     it("ends the task when the only channel fails with nothing to fall back to", async () => {
       allProvidersFail();
 
-      await expect(worker.process(dispatched() as any)).rejects.toBeInstanceOf(NonRetryableError);
+      await expect(worker.process(lastAttempt() as any)).rejects.toBeInstanceOf(NonRetryableError);
 
       expect(mockEnrichedProducers.normal.publish).not.toHaveBeenCalled();
       expect(mockGlobalEmitter.emit).toHaveBeenCalledWith(
@@ -1790,7 +1831,7 @@ describe("DeliveryWorker", () => {
       allProvidersFail();
 
       await expect(
-        worker.process(dispatched({ fallbackChain: [], recipient }) as any),
+        worker.process(lastAttempt({ fallbackChain: [], recipient }) as any),
       ).rejects.toBeInstanceOf(NonRetryableError);
 
       expect(mockEnrichedProducers.normal.publish).not.toHaveBeenCalled();
@@ -1803,7 +1844,7 @@ describe("DeliveryWorker", () => {
       // Without one the chain is inert, so the task has to fail terminally
       // rather than look like it was handed on.
       await expect(
-        worker.process(dispatched({ fallbackChain: ["sms", "push"] }) as any),
+        worker.process(lastAttempt({ fallbackChain: ["sms", "push"] }) as any),
       ).rejects.toBeInstanceOf(NonRetryableError);
 
       expect(mockEnrichedProducers.normal.publish).not.toHaveBeenCalled();
@@ -1812,7 +1853,7 @@ describe("DeliveryWorker", () => {
     it("clears the chain on the final hop instead of passing an empty array on", async () => {
       allProvidersFail();
 
-      await worker.process(dispatched({ fallbackChain: ["sms"], recipient }) as any);
+      await worker.process(lastAttempt({ fallbackChain: ["sms"], recipient }) as any);
 
       const published = mockEnrichedProducers.normal.publish.mock.calls[0]![0];
       expect(published.payload.channel).toBe("sms");
@@ -1824,7 +1865,7 @@ describe("DeliveryWorker", () => {
       allProvidersFail();
 
       // Hop one: email fails and hands the task to sms with the chain spent.
-      await worker.process(dispatched({ fallbackChain: ["sms"], recipient }) as any);
+      await worker.process(lastAttempt({ fallbackChain: ["sms"], recipient }) as any);
       const next = mockEnrichedProducers.normal.publish.mock.calls[0]![0].payload;
       expect(next.channel).toBe("sms");
 
@@ -1832,7 +1873,7 @@ describe("DeliveryWorker", () => {
       mockEnrichedProducers.normal.publish.mockClear();
       await expect(
         worker.process(
-          dispatched({
+          lastAttempt({
             channel: next.channel,
             fallbackChain: next.fallbackChain,
             destination: "+15551234567",
@@ -3265,6 +3306,7 @@ describe("DeliveryWorker", () => {
           channel: "email",
           destination: "test@example.com",
           priority: "normal",
+          deliveryAttemptCount: 2,
           fallbackChain: ["sms"],
           recipient: { phone: "+1234567890" },
         },
@@ -3304,8 +3346,10 @@ describe("DeliveryWorker", () => {
       },
     };
 
-    // process should throw the error so the worker retry logic handles it
-    await expect(worker.process(msg as any)).rejects.toThrow("Circuit breaker is OPEN");
+    // Parked through the scheduler for a later attempt, not failed.
+    await expect(worker.process(msg as any)).resolves.toBeUndefined();
+    expect(mockScheduledProducer.publish).toHaveBeenCalledTimes(1);
+    expect(mockIdempotency.markProcessed).not.toHaveBeenCalled();
     // Ensure it was NOT fallback-published
     expect(mockEnrichedProducers.normal.publish).not.toHaveBeenCalled();
   });
@@ -3332,6 +3376,7 @@ describe("DeliveryWorker", () => {
           channel: "email",
           destination: "test@example.com",
           priority: "normal",
+          deliveryAttemptCount: 2,
           fallbackChain: ["sms"],
           recipient: { phone: "+15551234567" },
         },
@@ -3436,6 +3481,7 @@ describe("DeliveryWorker", () => {
       event: {
         payload: {
           taskId: "task-all-fail",
+          deliveryAttemptCount: 2,
           projectId: "proj-1",
           enrichedEventId: "evt-1",
           recipientId: "usr-1",

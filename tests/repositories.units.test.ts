@@ -295,6 +295,7 @@ describe("Repository mapping and guards", () => {
       mockDb.queueDelete([]); // suppressions
       mockDb.queueDelete([]); // messageLogs
       mockDb.queueDelete([]); // workflowInstances
+      mockDb.queueDelete([]); // workflowDefinitions
       mockDb.queueDelete([{ id: "proj-1" }]); // projects
       await expect(repo.delete("proj-1")).resolves.toBe(true);
 
@@ -302,6 +303,7 @@ describe("Repository mapping and guards", () => {
       mockDb.queueDelete([]); // suppressions
       mockDb.queueDelete([]); // messageLogs
       mockDb.queueDelete([]); // workflowInstances
+      mockDb.queueDelete([]); // workflowDefinitions
       mockDb.queueDelete([]); // projects
       await expect(repo.delete("ghost")).resolves.toBe(false);
     });
@@ -313,8 +315,8 @@ describe("Repository mapping and guards", () => {
       mockDb.queueSelect([{ id: "u-1" }, { id: "u-2" }]);
       // 2. Child user tables deletes (6 deletes)
       for (let i = 0; i < 6; i++) mockDb.queueDelete([]);
-      // 3. Project child tables deletes (3 deletes)
-      for (let i = 0; i < 3; i++) mockDb.queueDelete([]);
+      // 3. Project child tables deletes (4 deletes)
+      for (let i = 0; i < 4; i++) mockDb.queueDelete([]);
       // 4. Final delete of project returns deleted row
       mockDb.queueDelete([{ id: "proj-1" }]);
 

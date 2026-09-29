@@ -66,7 +66,11 @@ export class DiscordTransport implements Transport {
     const subject = content.subject;
     // Discord messages have no subject line of their own, so a template that
     // renders one is bolded onto the first line rather than dropped.
-    const text = subject ? `**${subject}**\n${body}` : body;
+    // Either part may be missing: a subject-only template must not post
+    // "undefined" underneath it.
+    const text = [subject ? `**${subject}**` : undefined, body]
+      .filter((part) => typeof part === "string" && part)
+      .join("\n");
 
     // A template may carry its own sender, so one webhook can post as
     // different bots for different alert types.

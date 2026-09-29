@@ -73,7 +73,10 @@ export class ResendTransport implements Transport {
         from,
         to,
         subject: subject ?? "Notification",
-        html: htmlBody ?? `<p>${body}</p>`,
+        // A text-only template gets an HTML part built from its text. The text
+        // was rendered unescaped (it is plain text), so it is escaped here —
+        // otherwise a variable holding markup becomes live HTML in the email.
+        html: htmlBody ?? (typeof body === "string" ? textToHtml(body) : undefined),
         text: body,
         ...(replyTo ? { replyTo } : {}),
         ...(headers && Object.keys(headers).length > 0 ? { headers } : {}),
@@ -248,4 +251,14 @@ export class ResendTransport implements Transport {
     }
     return [];
   }
+}
+
+function textToHtml(text: string): string {
+  const escaped = text
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#039;");
+  return `<p>${escaped.replace(/\r?\n/g, "<br>")}</p>`;
 }

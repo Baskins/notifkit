@@ -270,6 +270,7 @@ export const workflowStatusEnum = pgEnum("workflow_status", [
   "running",
   "completed",
   "failed",
+  "canceled",
 ]);
 
 export const workflowDefinitions = pgTable(

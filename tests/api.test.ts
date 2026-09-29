@@ -173,6 +173,9 @@ describe("API Handlers", () => {
         listApiKeys: vi.fn().mockResolvedValue([]),
         deleteApiKey: vi.fn().mockResolvedValue(true),
         updateApiKeyHash: vi.fn().mockResolvedValue(true),
+        findThrottleSettings: vi
+          .fn()
+          .mockResolvedValue({ throttleLimit: null, throttleWindowHours: null }),
       } as any,
       workflowRepo: {
         listDefinitions: vi.fn().mockResolvedValue([]),
@@ -509,6 +512,10 @@ describe("API Handlers", () => {
   });
 
   describe("New CRUD Endpoints", () => {
+    const PROJECT_UUID = "11111111-1111-4111-8111-111111111111";
+    const KEY_UUID = "22222222-2222-4222-8222-222222222222";
+    const WF_ID = "33333333-3333-4333-8333-333333333333";
+
     it("listWorkflows", async () => {
       const res = createMockRes();
       await handlers.listWorkflows({} as any, res, {
@@ -525,11 +532,11 @@ describe("API Handlers", () => {
       const res = createMockRes();
       await handlers.getWorkflow({} as any, res, {
         projectId: "proj_1",
-        params: { id: "wf_1" },
+        params: { id: WF_ID },
         query: new URLSearchParams(),
       } as any);
       expect(res.statusCode).toBe(200);
-      expect(deps.workflowRepo.getInstance).toHaveBeenCalledWith("proj_1", "wf_1");
+      expect(deps.workflowRepo.getInstance).toHaveBeenCalledWith("proj_1", WF_ID);
     });
 
     it("listUsers", async () => {
@@ -590,11 +597,11 @@ describe("API Handlers", () => {
       const res = createMockRes();
       await handlers.updateProject(req, res, {
         projectId: "proj_1",
-        params: { id: "proj_1" },
+        params: { id: PROJECT_UUID },
         query: new URLSearchParams(),
       } as any);
       expect(res.statusCode).toBe(200);
-      expect(deps.projectRepo.updateSettings).toHaveBeenCalledWith("proj_1", {
+      expect(deps.projectRepo.updateSettings).toHaveBeenCalledWith(PROJECT_UUID, {
         rateLimitRpm: 1000,
       });
     });
@@ -603,11 +610,11 @@ describe("API Handlers", () => {
       const res = createMockRes();
       await handlers.deleteProject({} as any, res, {
         projectId: "proj_1",
-        params: { id: "proj_1" },
+        params: { id: PROJECT_UUID },
         query: new URLSearchParams(),
       } as any);
       expect(res.statusCode).toBe(204);
-      expect(deps.projectRepo.delete).toHaveBeenCalledWith("proj_1");
+      expect(deps.projectRepo.delete).toHaveBeenCalledWith(PROJECT_UUID);
     });
 
     it("createProjectKey", async () => {
@@ -616,7 +623,7 @@ describe("API Handlers", () => {
       (deps.projectRepo.createApiKey as any).mockResolvedValue({ id: "key_1" });
       await handlers.createProjectKey(req, res, {
         projectId: "proj_1",
-        params: { id: "proj_1" },
+        params: { id: PROJECT_UUID },
         query: new URLSearchParams(),
       } as any);
       expect(res.statusCode).toBe(201);
@@ -630,11 +637,11 @@ describe("API Handlers", () => {
       (deps.projectRepo.listApiKeys as any).mockResolvedValue([{ id: "key_1", role: "admin" }]);
       await handlers.listProjectKeys({ method: "GET" } as any, res, {
         projectId: "proj_1",
-        params: { id: "proj_1" },
+        params: { id: PROJECT_UUID },
         query: new URLSearchParams(),
       } as any);
       expect(res.statusCode).toBe(200);
-      expect(deps.projectRepo.listApiKeys).toHaveBeenCalledWith("proj_1");
+      expect(deps.projectRepo.listApiKeys).toHaveBeenCalledWith(PROJECT_UUID);
     });
 
     it("deleteProjectKey", async () => {
@@ -642,11 +649,11 @@ describe("API Handlers", () => {
       (deps.projectRepo.deleteApiKey as any).mockResolvedValue(true);
       await handlers.deleteProjectKey({ method: "DELETE" } as any, res, {
         projectId: "proj_1",
-        params: { id: "proj_1", keyId: "key_1" },
+        params: { id: PROJECT_UUID, keyId: KEY_UUID },
         query: new URLSearchParams(),
       } as any);
       expect(res.statusCode).toBe(204);
-      expect(deps.projectRepo.deleteApiKey).toHaveBeenCalledWith("proj_1", "key_1");
+      expect(deps.projectRepo.deleteApiKey).toHaveBeenCalledWith(PROJECT_UUID, KEY_UUID);
     });
 
     it("deleteProjectKey returns 404 if key does not exist", async () => {

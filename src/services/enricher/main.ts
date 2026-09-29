@@ -11,6 +11,7 @@ import {
   buildStreamEvent,
   type NotificationCreatedPayload,
   type NotificationEnrichedPayload,
+  type NotificationChannel,
   type StreamEvent,
 } from "@/index.js";
 import { IdempotencyGuard } from "@/index.js";
@@ -21,7 +22,7 @@ import {
   ContactRepository,
 } from "@/index.js";
 import { TemplateCache } from "@/templates/index.js";
-import { getPriorityBucket, type WorkerOptions } from "@/shared/index.js";
+import { getPriorityBucket, globalEmitter, type WorkerOptions } from "@/shared/index.js";
 import { startHealthReporter } from "@/workers/index.js";
 import {
   createPriorityProducers,
@@ -256,10 +257,13 @@ export class EnricherWorker extends BaseWorker {
         const profile = await this.userRepo.findRecordById(raw.projectId, raw.recipientId);
         if (!profile) return;
 
-        const prefs = await this.prefRepo.findByUserId(raw.projectId, raw.recipientId);
-        const optedOutTypes = new Set(
-          prefs.filter((p: any) => !p.optedIn).map((p: any) => p.eventType),
-        );
+        // Opt-outs are keyed on the template's topics, as on the requested
+        // path. `event.type` is always "notification.created", which no user
+        // ever opts out of, so checking it here let every opt-out through.
+        const template = raw.templateId
+          ? await this.templateCache.getCachedTemplate(raw.projectId, raw.templateId)
+          : null;
+        const topics: string[] = template?.topics ?? [];
 
         const enrichedPayload: NotificationEnrichedPayload = {
           projectId: raw.projectId,
@@ -275,8 +279,7 @@ export class EnricherWorker extends BaseWorker {
             locale: profile.language ?? "en",
             timezone: profile.timezone ?? "UTC",
             preferences: {
-              optedOut:
-                optedOutTypes.has(event.type) || profile.preferences.topics?.[event.type] === false,
+              optedOut: topics.some((t) => profile.preferences.topics?.[t] === false),
               channels: Object.entries(profile.preferences.channels ?? {})
                 .filter(([_, enabled]) => !enabled)
                 .map(([channel]) => channel as any),
@@ -311,6 +314,7 @@ export class EnricherWorker extends BaseWorker {
           "event enriched",
         );
       } catch (err) {
+        await this.idempotency.unmark(dedupeId).catch(() => {});
         throw err;
       }
       await Promise.all(publishPromises).catch(async (err) => {
@@ -345,24 +349,16 @@ export class EnricherWorker extends BaseWorker {
 
       const maxUsers = readBaseConfig().SEGMENT_MAX_USERS;
       if (userIds.length > maxUsers) {
+        const reason = `Segment fan-out of ${userIds.length} exceeds limit of ${maxUsers}`;
         this.logger.error(
           { count: userIds.length, max: maxUsers, projectId: raw.projectId, eventId: event.id },
           "Segment fan-out exceeds maximum allowed limit",
         );
-        const p = getPriorityBucket(raw.priority ?? "normal");
-        const producer = this.producers[p] ?? this.producers.normal;
-        await producer.publish(
-          buildStreamEvent(
-            "notification.failed",
-            {
-              projectId: raw.projectId,
-              rawEventId: event.id,
-              error: `Segment fan-out of ${userIds.length} exceeds limit of ${maxUsers}`,
-            },
-            "enricher",
-            event.metadata.traceId,
-          ),
-        );
+        // Reported to the caller, not published: a `notification.failed` on
+        // the enriched stream is not a payload the engine can read, so the
+        // refusal used to vanish there without a trace.
+        globalEmitter.emit("notification:failed", event.id, reason, event.type);
+        await this.idempotency.markProcessed(dedupeId);
         return;
       }
 
@@ -374,14 +370,9 @@ export class EnricherWorker extends BaseWorker {
         : null;
       const topics: string[] = template?.topics ?? [];
 
-      const channels =
-        raw.channels && raw.channels.length > 0 ? raw.channels : (["email"] as any[]);
+      const channels: NotificationChannel[] =
+        raw.channels && raw.channels.length > 0 ? raw.channels : ["email"];
       const isFallback = (raw as any).fallback === true;
-
-      // If fallback is true, we only emit the first channel, and pass the rest in fallbackChain.
-      // If fallback is false, we emit all channels concurrently.
-      const channelsToProcess = isFallback ? [channels[0]] : channels;
-      const fallbackChain = isFallback ? channels.slice(1) : undefined;
 
       const chunkArray = <T>(arr: T[], size: number) =>
         Array.from({ length: Math.ceil(arr.length / size) }, (v, i) =>
@@ -410,9 +401,36 @@ export class EnricherWorker extends BaseWorker {
         };
 
         for (const profile of profiles) {
-          for (const channel of channelsToProcess) {
-            const contacts = contactsByUser.get(profile.userId) ?? [];
-            const channelContacts = contacts.filter((contact: any) => contact.channel === channel);
+          const contacts = contactsByUser.get(profile.userId) ?? [];
+          // This user's addresses on a channel, less any that opted out of one
+          // of this template's topics.
+          const usable = (channel: string) =>
+            contacts.filter(
+              (contact: any) =>
+                contact.channel === channel &&
+                !topics.some((t) => contact.preferences?.topics?.[t] === false),
+            );
+
+          // Without fallback every requested channel is sent at once. With it,
+          // start at the first channel this user can be reached on and chain the
+          // rest behind it — a user with no email address still gets the SMS.
+          let userChannels: NotificationChannel[] = channels;
+          let fallbackChain: NotificationChannel[] | undefined;
+          if (isFallback) {
+            const first = channels.findIndex((c: NotificationChannel) => usable(c).length > 0);
+            if (first === -1) {
+              this.logger.info(
+                { recipientId: profile.userId, channels },
+                "no active contact on any fallback channel",
+              );
+              continue;
+            }
+            userChannels = [channels[first]!];
+            fallbackChain = channels.slice(first + 1);
+          }
+
+          for (const channel of userChannels) {
+            const channelContacts = usable(channel);
             // Push resolves its active tokens at send time so token invalidation
             // remains current. Other channels need one task per address.
             const resolved: ({ id: string; target: string } | undefined)[] =
@@ -430,7 +448,7 @@ export class EnricherWorker extends BaseWorker {
                 projectId: raw.projectId,
                 rawEventId: event.id,
                 recipientId: profile.userId,
-                channel: channel,
+                channel,
                 priority: "normal",
                 templateId: raw.templateId,
                 templateVariables: raw.data,
@@ -464,6 +482,7 @@ export class EnricherWorker extends BaseWorker {
                 contactId: contact?.id,
                 destination,
                 campaignId: raw.campaignId,
+                workflowInstanceId: raw.workflowInstanceId,
               };
 
               const msgPriority = raw.priority ?? "normal";
@@ -520,6 +539,9 @@ export class EnricherWorker extends BaseWorker {
         "event enriched",
       );
     } catch (err) {
+      // Release the marker, or a retry landing inside its TTL is taken for a
+      // duplicate and acked without ever being processed.
+      await this.idempotency.unmark(dedupeId).catch(() => {});
       throw err;
     }
 

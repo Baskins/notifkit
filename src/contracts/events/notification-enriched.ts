@@ -50,5 +50,13 @@ export const NotificationEnrichedPayloadSchema = z.object({
   destination: z.string().min(1).optional(),
   /** Campaign this message belongs to, carried from the originating request. */
   campaignId: z.string().min(1).max(128).optional(),
+  /** Workflow instance whose step sent this, carried to the delivery log. */
+  workflowInstanceId: z.string().uuid().optional(),
+  /**
+   * Set on delivery's channel fallback. The notification was counted against
+   * the user's throttle when it was first sent; counting it again per channel
+   * it falls back through would drop the very send meant to reach them.
+   */
+  throttleCounted: z.boolean().optional(),
 });
 export type NotificationEnrichedPayload = z.infer<typeof NotificationEnrichedPayloadSchema>;

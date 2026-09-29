@@ -26,7 +26,12 @@ import {
 } from "@/workflows/index.js";
 import { type WorkerOptions } from "@/shared/index.js";
 import { startHealthReporter } from "@/workers/index.js";
-import { createStreamConsumer, createWorkerRuntime, shutdownWorker } from "@/workers/bootstrap.js";
+import {
+  createStreamConsumer,
+  createWorkerRuntime,
+  shutdownWorker,
+  uniqueConsumerId,
+} from "@/workers/bootstrap.js";
 
 /** How long a workflow instance lock is held before it self-expires. */
 const WORKFLOW_LOCK_TTL_SECONDS = 60;
@@ -34,6 +39,11 @@ const WORKFLOW_LOCK_TTL_SECONDS = 60;
 const WORKFLOW_LOCK_RENEW_MS = (WORKFLOW_LOCK_TTL_SECONDS / 3) * 1000;
 /** How long a claimed workflow timer stays invisible to other pollers. */
 const WORKFLOW_TIMER_VISIBILITY_MS = 60_000;
+/** Wake-ups for sleeping instances: waits, event timeouts, deferred resumes. */
+export const WORKFLOW_TIMERS_KEY = "notif:workflow:timers";
+/** How soon a resume that found its instance busy is tried again. */
+const WORKFLOW_RESUME_RETRY_MS = 2_000;
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 loadEnv();
 const config = readBaseConfig();
@@ -119,6 +129,25 @@ export class WorkflowWorker extends BaseWorker {
     }
   }
 
+  /**
+   * Re-delivers a resume through the timer ZSET a few seconds from now. The
+   * poll loop publishes it once the instance is pending again, and drops it if
+   * the instance has finished. The member carries no timestamp, so repeated
+   * deferrals of one instance collapse into a single entry.
+   */
+  private async deferResume(payload: any): Promise<void> {
+    await this.redisCli.zadd(
+      WORKFLOW_TIMERS_KEY,
+      Date.now() + WORKFLOW_RESUME_RETRY_MS,
+      JSON.stringify({
+        instanceId: payload.instanceId,
+        name: payload.name,
+        projectId: payload.projectId,
+        input: payload.input ?? {},
+      }),
+    );
+  }
+
   async process(message: StreamMessage): Promise<void> {
     const { event } = message;
     const publishPromises: Promise<void>[] = [];
@@ -189,7 +218,12 @@ export class WorkflowWorker extends BaseWorker {
       "NX",
     );
     if (!acquired) {
-      this.logger.info({ instanceId }, "Workflow is locked by another process, skipping");
+      // Another process is mid-run on this instance — typically still
+      // persisting the very suspension this resume answers, when the awaited
+      // event arrived quickly. Acking here dropped the resume, and with the
+      // waiter already consumed nothing would ever wake the instance again.
+      this.logger.info({ instanceId }, "Workflow is locked by another process, deferring resume");
+      await this.deferResume(payload);
       return;
     }
 
@@ -225,6 +259,13 @@ export class WorkflowWorker extends BaseWorker {
         instance = rows[0]!;
       }
 
+      if (instance.status === "running") {
+        // Its last holder died mid-run (the reaper will set it back to
+        // pending) or has not finished suspending. Either way this resume
+        // is still owed.
+        await this.deferResume(payload);
+        return;
+      }
       if (instance.status !== "pending") {
         this.logger.info({ instanceId }, "Workflow is not pending, skipping");
         return;
@@ -259,6 +300,9 @@ export class WorkflowWorker extends BaseWorker {
             instance!.input,
             payload.projectId,
             `wf-${instanceId}-${stepId}`,
+            // The contract wants a uuid, which the API always issues; anything
+            // else would fail validation and drop the notification.
+            UUID_RE.test(instanceId) ? instanceId : undefined,
           );
 
           const result = await new Promise<{ messageId: string; notificationId: string }>(
@@ -295,7 +339,15 @@ export class WorkflowWorker extends BaseWorker {
         },
         wait: async (duration) => {
           const stepId = String(currentStepIndex++);
-          if (stepOutputMap.has(stepId)) return;
+          if (stepOutputMap.has(stepId)) {
+            // A resume that arrives early — a duplicate trigger, a replayed
+            // message — must not cut the sleep short. The timer is still set.
+            const until = Number(stepOutputMap.get(stepId)?.scheduledAt);
+            if (Number.isFinite(until) && until > Date.now()) {
+              throw new SuspendExecutionError("wait", { duration });
+            }
+            return;
+          }
 
           // Simple duration parse (e.g. '2h' -> ms)
           let ms = 0;
@@ -311,7 +363,7 @@ export class WorkflowWorker extends BaseWorker {
           // If the process dies after this point the source event is retried;
           // if it dies after the database write, the timer is already durable.
           await this.redisCli.zadd(
-            "notif:workflow:timers",
+            WORKFLOW_TIMERS_KEY,
             resumeAt,
             JSON.stringify({
               instanceId: instance!.id,
@@ -335,7 +387,12 @@ export class WorkflowWorker extends BaseWorker {
           const stepId = String(currentStepIndex++);
           if (stepOutputMap.has(stepId)) {
             const out = stepOutputMap.get(stepId);
-            if (out && typeof out === "object" && (out as any).timedOut === true) {
+            // Still waiting: neither the event nor the timeout has filled the
+            // step in, so this resume is spurious.
+            if (out === null || out === undefined) {
+              throw new SuspendExecutionError("waitForEvent", { eventName });
+            }
+            if (typeof out === "object" && (out as any).timedOut === true) {
               return null;
             }
             return out;
@@ -355,7 +412,7 @@ export class WorkflowWorker extends BaseWorker {
           const resumeAt = Date.now() + ms;
 
           await this.redisCli.zadd(
-            "notif:workflow:timers",
+            WORKFLOW_TIMERS_KEY,
             resumeAt,
             JSON.stringify({
               instanceId: instance!.id,
@@ -368,22 +425,22 @@ export class WorkflowWorker extends BaseWorker {
             }),
           );
 
-          // Register waiter
-          await this.dbConn.insert(workflowWaiters).values({
-            instanceId: instance!.id,
-            projectId: payload.projectId,
-            eventName: eventName,
-            matchCriteria: options.match,
-            expiresAt: new Date(resumeAt),
-          });
-
-          // Register step as pending event
+          // The pending step before the waiter: an event that matches the
+          // waiter the moment it exists must find a step to record itself in.
           await this.dbConn.insert(workflowSteps).values({
             instanceId: instance!.id,
             projectId: payload.projectId,
             stepIndex: stepId,
             action: "waitForEvent",
             output: null, // this will be updated by event worker or timeout
+          });
+
+          await this.dbConn.insert(workflowWaiters).values({
+            instanceId: instance!.id,
+            projectId: payload.projectId,
+            eventName: eventName,
+            matchCriteria: options.match,
+            expiresAt: new Date(resumeAt),
           });
 
           throw new SuspendExecutionError("waitForEvent", { eventName });
@@ -466,7 +523,7 @@ export async function startWorkflowWorker() {
     {
       stream: STREAMS.WORKFLOW_INBOUND,
       group: CONSUMER_GROUPS.WORKFLOW,
-      consumer: `workflow-${process.pid}`,
+      consumer: uniqueConsumerId("workflow"),
       batchSize: config.WORKER_CONCURRENCY,
     },
   ));
@@ -488,7 +545,7 @@ export async function startWorkflowWorker() {
       try {
         const now = Date.now();
         const tasks = await redis.native.schedulerPoll(
-          "notif:workflow:timers",
+          WORKFLOW_TIMERS_KEY,
           now,
           100,
           WORKFLOW_TIMER_VISIBILITY_MS,
@@ -505,8 +562,13 @@ export async function startWorkflowWorker() {
               .where(eq(workflowInstances.id, task.instanceId))
               .limit(1)
           )[0];
-          if (!inst || inst.status === "completed" || inst.status === "failed") {
-            await redis.native.zrem("notif:workflow:timers", taskStr);
+          if (
+            !inst ||
+            inst.status === "completed" ||
+            inst.status === "failed" ||
+            inst.status === "canceled"
+          ) {
+            await redis.native.zrem(WORKFLOW_TIMERS_KEY, taskStr);
             continue;
           }
           // A timer can be observed while the worker is still persisting the
@@ -530,7 +592,7 @@ export async function startWorkflowWorker() {
             // If the waiter was already deleted (by EventWorker when event arrived before timeout),
             // this timer is stale. Clean up from Redis and skip re-resuming the workflow.
             if (deleted.length === 0) {
-              await redis.native.zrem("notif:workflow:timers", taskStr);
+              await redis.native.zrem(WORKFLOW_TIMERS_KEY, taskStr);
               continue;
             }
 
@@ -556,7 +618,7 @@ export async function startWorkflowWorker() {
           await workflowProducer.publish(
             buildStreamEvent("workflow.resumed", task, "scheduler", undefined),
           );
-          await redis.native.zrem("notif:workflow:timers", taskStr);
+          await redis.native.zrem(WORKFLOW_TIMERS_KEY, taskStr);
           logger.info({ instanceId: task.instanceId }, "Workflow resumed from timer");
         }
       } catch (err) {

@@ -45,8 +45,15 @@ export const NotificationDispatchedPayloadSchema = z.object({
   deliveryOptions: DeliveryOptionsSchema,
   fallbackChain: z.array(NotificationChannelSchema).optional(),
   throttleAttemptCount: z.number().int().nonnegative().optional(),
+  /**
+   * Provider attempts that already failed. Delivery re-queues a failed send
+   * through the scheduler until this reaches `deliveryOptions.maxAttempts`.
+   */
+  deliveryAttemptCount: z.number().int().nonnegative().optional(),
   /** Campaign this message belongs to, carried from the originating request. */
   campaignId: z.string().min(1).max(128).optional(),
+  /** Workflow instance whose step sent this, recorded on the delivery log. */
+  workflowInstanceId: z.string().uuid().optional(),
 });
 /** A `notification.dispatched` task as it travels on the outbound stream. */
 export type DispatchedTaskPayload = z.infer<typeof NotificationDispatchedPayloadSchema>;

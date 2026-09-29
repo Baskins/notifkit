@@ -1,4 +1,5 @@
 import { describe, it, expect, vi } from "vitest";
+import { globalEmitter } from "@/shared/index.js";
 import { EnricherWorker } from "@/services/enricher/main.js";
 import { CircuitBreaker } from "@/shared/index.js";
 import { StreamConsumer } from "@/queue/index.js";
@@ -51,17 +52,21 @@ describe("Phase 3 Reliability Features", () => {
         },
       };
 
-      await worker.process(message as any);
+      const failures: unknown[][] = [];
+      const onFailed = (...args: unknown[]) => failures.push(args);
+      globalEmitter.on("notification:failed", onFailed);
+      try {
+        await worker.process(message as any);
+      } finally {
+        globalEmitter.off("notification:failed", onFailed);
+      }
 
-      // Verify it emitted a failure event instead of processing
-      expect(mockProducer.publish).toHaveBeenCalledWith(
-        expect.objectContaining({
-          type: "notification.failed",
-          payload: expect.objectContaining({
-            error: expect.stringContaining("exceeds limit"),
-          }),
-        }),
-      );
+      // Reported as a failure, and nothing fanned out. (A `notification.failed`
+      // on the enriched stream is not something the engine can read.)
+      expect(failures).toHaveLength(1);
+      expect(String(failures[0]![1])).toContain("exceeds limit");
+      expect(mockProducer.publish).not.toHaveBeenCalled();
+      expect(mockProducer.publishBatch).not.toHaveBeenCalled();
     });
   });
 

@@ -11,6 +11,8 @@ export default defineConfig({
     environment: "node",
     include: ["tests/**/*.test.ts", "packages/**/*.test.ts"],
     exclude: ["**/node_modules/**", "**/dist/**", "profiling/**", ".agents/**"],
+    // Starts the Postgres and Redis every file under tests/integration shares.
+    globalSetup: ["tests/integration/support/global-setup.ts"],
     testTimeout: 1200_000,
     hookTimeout: 1200_000,
     coverage: {

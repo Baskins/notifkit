@@ -90,6 +90,7 @@ export function buildStepNotifyPayload(
   instanceInput: unknown,
   projectId: string,
   idempotencyKey?: string,
+  workflowInstanceId?: string,
 ): NotificationRequestedPayload {
   return {
     projectId,
@@ -102,5 +103,6 @@ export function buildStepNotifyPayload(
     fallback: args.fallback ?? false,
     scheduledAt: args.sendAt,
     idempotencyKey,
+    ...(workflowInstanceId ? { workflowInstanceId } : {}),
   };
 }

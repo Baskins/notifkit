@@ -28,7 +28,11 @@ describe("AiWorker Edge Cases", () => {
     };
     mockGenerateAiContent = vi.fn().mockResolvedValue("generated_text");
     mockTemplateCache = { getCachedTemplate: vi.fn().mockResolvedValue(null) };
-    mockDb = { insert: vi.fn().mockReturnThis(), values: vi.fn().mockReturnThis() };
+    mockDb = {
+      insert: vi.fn().mockReturnThis(),
+      values: vi.fn().mockReturnThis(),
+      onConflictDoNothing: vi.fn().mockResolvedValue(undefined),
+    };
 
     worker = new AiWorker({
       consumer: { ack: vi.fn(), nack: vi.fn() } as any,

@@ -414,7 +414,13 @@ export class EngineWorker extends BaseWorker {
       // Quiet hours check
       const qh = enriched.recipient.preferences.quietHours;
       if (qh && qh.length > 0 && enriched.priority !== "critical") {
-        const qhResult = isInQuietHours(enriched.recipient.timezone, qh);
+        // Judged at the moment the message would go out, not the moment the
+        // engine sees it: a send booked for next week must not be pulled
+        // forward to tonight's quiet-hours end, and one booked for 3am must
+        // wait until the quiet hours are over.
+        const requestedAt = enriched.scheduledAt ? new Date(enriched.scheduledAt) : new Date();
+        const sendAt = requestedAt.getTime() > Date.now() ? requestedAt : new Date();
+        const qhResult = isInQuietHours(enriched.recipient.timezone, qh, sendAt);
         if (qhResult.inQuietHours && qhResult.nextActiveTime) {
           this.logger.info(
             {
@@ -444,18 +450,16 @@ export class EngineWorker extends BaseWorker {
         );
       }
 
-      const throttleResult = await this.throttle.check(
-        enriched.projectId,
-        enriched.recipientId,
-        enriched.priority,
-        {
-          limit: projectThrottle.throttleLimit,
-          windowHours: projectThrottle.throttleWindowHours,
-          scheduledAt: enriched.scheduledAt,
-          // A replayed message must not be counted against the user twice.
-          messageId: idempotencyKey,
-        },
-      );
+      // A channel fallback was counted when the notification was first sent.
+      const throttleResult = enriched.throttleCounted
+        ? { allowed: true, count: 0, limit: 0 }
+        : await this.throttle.check(enriched.projectId, enriched.recipientId, enriched.priority, {
+            limit: projectThrottle.throttleLimit,
+            windowHours: projectThrottle.throttleWindowHours,
+            scheduledAt: enriched.scheduledAt,
+            // A replayed message must not be counted against the user twice.
+            messageId: idempotencyKey,
+          });
       if (!throttleResult.allowed) {
         this.logger.info(
           {
@@ -476,8 +480,7 @@ export class EngineWorker extends BaseWorker {
         return;
       }
 
-      // Gather AI Prompts
-      // Gather AI Prompts
+      // Template-level AI prompts, overridden by any on the request.
       let dbTemplate = null;
       if (enriched.templateId) {
         dbTemplate = await this.templateCache.getCachedTemplate(
@@ -508,41 +511,10 @@ export class EngineWorker extends BaseWorker {
       // resulting opt-out applies to.
       const templateTopics: string[] = dbTemplate?.topics ?? [];
 
-      if (Object.keys(aiPrompts).length > 0) {
-        const aiPendingPayload = {
-          projectId: enriched.projectId,
-          enrichedEventId: event.id,
-          recipientId: enriched.recipientId,
-          channel: enriched.channel,
-          priority: enriched.priority,
-          templateId: enriched.templateId,
-          templateVariables: enriched.templateVariables,
-          recipient: enriched.recipient,
-          aiPrompts,
-          scheduledAt: enriched.scheduledAt,
-          fallbackChain: enriched.fallbackChain,
-        };
-
-        const aiPendingEnvelope = buildStreamEvent(
-          "notification.ai_pending",
-          aiPendingPayload as Record<string, unknown>,
-          "engine",
-          event.metadata.traceId,
-        );
-
-        await this.aiPendingProducer.publish(aiPendingEnvelope);
-        this.logger.info(
-          {
-            messageId: message.id,
-            eventId: event.id,
-            recipientId: enriched.recipientId,
-            traceId: event.metadata.traceId,
-          },
-          "task routed to AI worker",
-        );
-        await idempotency.markProcessed(idempotencyKey, customTtl);
-        return;
-      }
+      // AI-generated messages take the same gates as any other — contacts,
+      // topic opt-outs and suppressions below — and are handed to the AI worker
+      // per contact once they have passed them.
+      const useAi = Object.keys(aiPrompts).length > 0;
 
       // Rendering happens in delivery, just before the send, so the rendered
       // body does not travel through the outbound stream.
@@ -588,7 +560,8 @@ export class EngineWorker extends BaseWorker {
       });
 
       for (const contact of activeContacts) {
-        if (contact.preferences?.optedOut) {
+        // This address opted out of one of the template's topics.
+        if (templateTopics.some((t) => contact.preferences?.topics?.[t] === false)) {
           continue;
         }
 
@@ -670,7 +643,41 @@ export class EngineWorker extends BaseWorker {
           },
           fallbackChain: enriched.fallbackChain,
           campaignId: enriched.campaignId,
+          workflowInstanceId: enriched.workflowInstanceId,
         };
+
+        if (useAi) {
+          await this.aiPendingProducer.publish(
+            buildStreamEvent(
+              "notification.ai_pending",
+              {
+                projectId: enriched.projectId,
+                enrichedEventId: event.id,
+                recipientId: enriched.recipientId,
+                channel: enriched.channel,
+                priority: enriched.priority,
+                templateId: enriched.templateId,
+                templateVariables: enriched.templateVariables,
+                recipient: enriched.recipient,
+                aiPrompts,
+                scheduledAt: enriched.scheduledAt,
+                fallbackChain: enriched.fallbackChain,
+                taskId,
+                destination: resolvedDestination,
+                deliveryHeaders: unsubscribeHeaders,
+                campaignId: enriched.campaignId,
+                workflowInstanceId: enriched.workflowInstanceId,
+              },
+              "engine",
+              event.metadata.traceId,
+            ),
+          );
+          this.logger.debug(
+            { messageId: message.id, taskId, traceId: event.metadata.traceId },
+            "task routed to AI worker",
+          );
+          continue;
+        }
 
         const envelope = buildStreamEvent(
           "notification.dispatched",

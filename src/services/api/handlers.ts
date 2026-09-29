@@ -43,7 +43,7 @@ import { readJsonBody, sendJson, sendNoContent, sendValidationError } from "./ht
 import type { RouteContext } from "./router.js";
 import { globalEmitter, getPriorityBucket, normaliseTarget } from "@/shared/index.js";
 import { metrics } from "@/metrics/index.js";
-import { eq, desc, and, lt, lte, gte, sql, like, or, isNotNull, inArray } from "drizzle-orm";
+import { eq, desc, and, lte, gte, sql, like, or, isNotNull, inArray } from "drizzle-orm";
 import {
   messageLogs,
   workflowDefinitions,
@@ -175,6 +175,106 @@ async function persistUsers(deps: Deps, users: InlineUserLike[], projectId: stri
     await txUserRepo.upsertManyFull(projectId, usersList);
     await txContactRepo.upsertMany(projectId, contactsList);
   });
+}
+
+/**
+ * A dead-letter entry, read the way StreamConsumer writes it: the original
+ * event JSON under `data`, carrying a `dlq` block that records which stream it
+ * failed on. Flat `payload`/`eventType` fields are accepted for entries written
+ * by hand or by older versions.
+ */
+interface DlqEntry {
+  id: string;
+  eventType: string;
+  payload: any;
+  projectId?: string;
+  error: string;
+  timestamp: string;
+  /** The event as it was published, without its `dlq` block. */
+  event: Record<string, any> | null;
+  originalStream?: string;
+  fields: Record<string, string>;
+}
+
+function parseDlqEntry(id: string, rawFields: string[]): DlqEntry {
+  const fields: Record<string, string> = {};
+  for (let i = 0; i < rawFields.length; i += 2) {
+    fields[rawFields[i]!] = rawFields[i + 1]!;
+  }
+
+  let parsed: Record<string, any> | null = null;
+  if (fields.data) {
+    try {
+      parsed = JSON.parse(fields.data);
+    } catch {
+      parsed = null;
+    }
+  }
+  const { dlq, ...event } = parsed ?? {};
+
+  let payload: any = fields;
+  if (parsed) {
+    payload = event.payload;
+  } else if (fields.payload) {
+    try {
+      payload = JSON.parse(fields.payload);
+    } catch {
+      payload = fields.payload;
+    }
+  }
+
+  const ms = Number(id.split("-")[0]);
+  return {
+    id,
+    eventType: event.type ?? fields.eventType ?? fields.event_type ?? "unknown",
+    payload,
+    projectId: payload?.projectId ?? payload?.project_id ?? fields.projectId,
+    error: dlq?.reason ?? fields.error ?? fields.reason ?? "Dead letter payload",
+    timestamp:
+      dlq?.ackedAt ??
+      fields.timestamp ??
+      (Number.isFinite(ms) ? new Date(ms).toISOString() : new Date().toISOString()),
+    event: parsed ? event : null,
+    originalStream: dlq?.originalStream,
+    fields,
+  };
+}
+
+/**
+ * Ids that live in uuid columns. Anything else can match no row, and passing it
+ * to Postgres fails the query outright — a 500 for what is simply not found.
+ */
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const isUuid = (v: string | undefined): v is string => typeof v === "string" && UUID_RE.test(v);
+
+/** Opaque position in the delivery log: a row's full-precision timestamp and id. */
+function encodeLogCursor(ts: string, id: string): string {
+  return Buffer.from(JSON.stringify([ts, id])).toString("base64url");
+}
+
+function decodeLogCursor(cursor: string | null | undefined): { ts: string; id: string } | null {
+  if (!cursor) return null;
+  // Cursors handed out before this format were a millisecond timestamp.
+  if (/^d+$/.test(cursor)) {
+    return {
+      ts: new Date(Number(cursor)).toISOString(),
+      id: "ffffffff-ffff-ffff-ffff-ffffffffffff",
+    };
+  }
+  try {
+    const [ts, id] = JSON.parse(Buffer.from(cursor, "base64url").toString("utf8"));
+    if (
+      typeof ts === "string" &&
+      typeof id === "string" &&
+      !Number.isNaN(Date.parse(ts)) &&
+      /^[0-9a-f-]{36}$/i.test(id)
+    ) {
+      return { ts, id };
+    }
+  } catch {
+    // fall through
+  }
+  return null;
 }
 
 function getQueryParam(ctx: RouteContext, key: string): string | undefined {
@@ -662,34 +762,82 @@ export function createHandlers(deps: Deps) {
       );
     }
 
-    if (cursor) {
-      const cursorDate = new Date(parseInt(cursor, 10));
-      conditions.push(lt(messageLogs.timestamp, cursorDate));
-    }
+    // One entry per task, newest activity first. Rows are scanned in
+    // (timestamp, id) order — a batch of deliveries shares one timestamp, so
+    // the timestamp alone cannot mark a place — and a task is listed at its
+    // newest row. The cursor is that row for the first task of the next page,
+    // and any task with a row newer than the cursor was listed on an earlier
+    // page. Paging on a millisecond timestamp over `limit * 2` rows skipped
+    // tasks that shared a timestamp and dropped any that did not fit the slice.
+    const start = decodeLogCursor(cursor);
+    const tsText = sql<string>`${messageLogs.timestamp}::text`;
+    const position = (ts: string, id: string) => sql`(${ts}::timestamptz, ${id}::uuid)`;
+    const rowKey = sql`(${messageLogs.timestamp}, ${messageLogs.id})`;
 
-    const logs = await deps.db
-      .select()
-      .from(messageLogs)
-      .where(and(...conditions))
-      .orderBy(desc(messageLogs.timestamp))
-      .limit(limit * 2);
+    const order: string[] = [];
+    const rowsByTask = new Map<string, (typeof messageLogs.$inferSelect)[]>();
+    let nextCursor: string | null = null;
+    let scanFrom = start;
+    let inclusive = true;
+    const batchSize = Math.max(limit * 4, 50);
 
-    // Deduplicate by taskId preserving the latest status per taskId
-    const deduplicatedMap = new Map<string, (typeof logs)[0]>();
-    for (const log of logs) {
-      if (!deduplicatedMap.has(log.taskId)) {
-        deduplicatedMap.set(log.taskId, log);
-      } else {
-        const existing = deduplicatedMap.get(log.taskId)!;
-        if (existing.status === "dispatched" && log.status !== "dispatched") {
-          deduplicatedMap.set(log.taskId, log);
-        }
+    for (let round = 0; round < 50 && nextCursor === null; round++) {
+      const batch = await deps.db
+        .select({ row: messageLogs, ts: tsText })
+        .from(messageLogs)
+        .where(
+          and(
+            ...conditions,
+            scanFrom
+              ? sql`${rowKey} ${inclusive ? sql`<=` : sql`<`} ${position(scanFrom.ts, scanFrom.id)}`
+              : undefined,
+          ),
+        )
+        .orderBy(desc(messageLogs.timestamp), desc(messageLogs.id))
+        .limit(batchSize);
+
+      const fresh = [...new Set(batch.map((b) => b.row.taskId))].filter((t) => !rowsByTask.has(t));
+      const listedEarlier = new Set<string>();
+      if (start && fresh.length > 0) {
+        const newer = await deps.db
+          .selectDistinct({ taskId: messageLogs.taskId })
+          .from(messageLogs)
+          .where(
+            and(
+              ...conditions,
+              inArray(messageLogs.taskId, fresh),
+              sql`${rowKey} > ${position(start.ts, start.id)}`,
+            ),
+          );
+        for (const r of newer) listedEarlier.add(r.taskId);
       }
-    }
-    const deduplicatedLogs = Array.from(deduplicatedMap.values()).slice(0, limit);
 
-    const nextCursor =
-      logs.length === limit * 2 ? logs[logs.length - 1]!.timestamp.getTime().toString() : null;
+      for (const { row, ts } of batch) {
+        if (listedEarlier.has(row.taskId)) continue;
+        let rows = rowsByTask.get(row.taskId);
+        if (!rows) {
+          if (order.length === limit) {
+            nextCursor = encodeLogCursor(ts, row.id);
+            break;
+          }
+          rows = [];
+          order.push(row.taskId);
+          rowsByTask.set(row.taskId, rows);
+        }
+        rows.push(row);
+      }
+
+      if (batch.length < batchSize) break;
+      const last = batch[batch.length - 1]!;
+      scanFrom = { ts: last.ts, id: last.row.id };
+      inclusive = false;
+    }
+
+    // The latest outcome, rather than the dispatch that preceded it.
+    const deduplicatedLogs = order.map((taskId) => {
+      const rows = rowsByTask.get(taskId)!;
+      return rows.find((r) => r.status !== "dispatched") ?? rows[0]!;
+    });
 
     sendJson(res, 200, { logs: deduplicatedLogs, nextCursor });
   }
@@ -875,7 +1023,9 @@ export function createHandlers(deps: Deps) {
     ctx: RouteContext,
   ): Promise<void> {
     const instanceId = ctx.params.id!;
-    const workflow = await deps.workflowRepo.getInstance(ctx.projectId!, instanceId);
+    const workflow = isUuid(instanceId)
+      ? await deps.workflowRepo.getInstance(ctx.projectId!, instanceId)
+      : null;
     if (!workflow) return sendJson(res, 404, { error: "workflow_not_found", id: instanceId });
 
     sendJson(res, 200, workflow);
@@ -888,7 +1038,8 @@ export function createHandlers(deps: Deps) {
     ctx: RouteContext,
   ): Promise<void> {
     const instanceId = ctx.params.id!;
-    const canceled = await deps.workflowRepo.cancelInstance(ctx.projectId!, instanceId);
+    const canceled =
+      isUuid(instanceId) && (await deps.workflowRepo.cancelInstance(ctx.projectId!, instanceId));
     if (!canceled) return sendJson(res, 400, { error: "workflow_not_cancelable", id: instanceId });
 
     logger.info({ instanceId }, "workflow canceled");
@@ -956,7 +1107,7 @@ export function createHandlers(deps: Deps) {
     ctx: RouteContext,
   ): Promise<void> {
     const id = ctx.params.id!;
-    const deleted = await deps.projectRepo.delete(id);
+    const deleted = isUuid(id) && (await deps.projectRepo.delete(id));
     if (!deleted) return sendJson(res, 404, { error: "project_not_found" });
 
     sendNoContent(res);
@@ -979,7 +1130,7 @@ export function createHandlers(deps: Deps) {
 
     if (!parsed.success) return sendValidationError(res, parsed.error);
 
-    const updated = await deps.projectRepo.updateSettings(id, parsed.data);
+    const updated = isUuid(id) && (await deps.projectRepo.updateSettings(id, parsed.data));
     if (!updated) return sendJson(res, 404, { error: "project_not_found" });
 
     // Drop the engine's cached throttle overrides so the change applies to the
@@ -1009,6 +1160,11 @@ export function createHandlers(deps: Deps) {
       .safeParse(await readJsonBody(req));
     const role = parsed.success ? parsed.data.role : "admin";
 
+    // A key for a project that does not exist would fail the foreign key.
+    if (!isUuid(id) || !(await deps.projectRepo.findThrottleSettings(id))) {
+      return sendJson(res, 404, { error: "project_not_found" });
+    }
+
     const apiKey = `nk_live_${randomBytes(32).toString("hex")}`;
     const apiKeyHash = createHash("sha256").update(apiKey).digest("hex");
 
@@ -1023,6 +1179,7 @@ export function createHandlers(deps: Deps) {
     ctx: RouteContext,
   ): Promise<void> {
     const id = ctx.params.id!;
+    if (!isUuid(id)) return sendJson(res, 404, { error: "project_not_found" });
     const keys = await deps.projectRepo.listApiKeys(id);
     sendJson(res, 200, { keys });
   }
@@ -1034,7 +1191,7 @@ export function createHandlers(deps: Deps) {
     ctx: RouteContext,
   ): Promise<void> {
     const { id, keyId } = ctx.params;
-    const deleted = await deps.projectRepo.deleteApiKey(id!, keyId!);
+    const deleted = isUuid(id) && isUuid(keyId) && (await deps.projectRepo.deleteApiKey(id, keyId));
     if (!deleted) return sendJson(res, 404, { error: "key_not_found" });
 
     await deps.redis.native.publish("apikey.invalidated", "*");
@@ -1234,39 +1391,38 @@ export function createHandlers(deps: Deps) {
         "COUNT",
         "100",
       );
-      const allMessages = (rawEntries || []).map(([id, fields]: [string, string[]]) => {
-        const fieldMap: Record<string, string> = {};
-        for (let i = 0; i < fields.length; i += 2) {
-          fieldMap[fields[i]!] = fields[i + 1]!;
-        }
-        let payload: any = fieldMap;
-        if (fieldMap.payload) {
-          try {
-            payload = JSON.parse(fieldMap.payload);
-          } catch {
-            payload = fieldMap.payload;
-          }
-        }
-        return {
-          id,
-          eventType: fieldMap.eventType || fieldMap.event_type || "unknown",
-          payload,
-          error: fieldMap.error || fieldMap.reason || "Dead letter payload",
-          timestamp: fieldMap.timestamp || new Date().toISOString(),
-        };
-      });
+      const allMessages = (rawEntries || []).map(([id, fields]: [string, string[]]) =>
+        parseDlqEntry(id, fields),
+      );
 
       const messages = ctx.projectId
-        ? allMessages.filter((m) => {
-            const pId = m.payload?.projectId ?? m.payload?.project_id ?? (m as any).projectId;
-            return pId === ctx.projectId;
-          })
+        ? allMessages.filter((m) => m.projectId === ctx.projectId)
         : allMessages;
 
-      sendJson(res, 200, { messages: messages.slice(0, 50) });
+      sendJson(res, 200, {
+        messages: messages.slice(0, 50).map((m) => ({
+          id: m.id,
+          eventType: m.eventType,
+          payload: m.payload,
+          error: m.error,
+          timestamp: m.timestamp,
+          originalStream: m.originalStream,
+        })),
+      });
     } catch {
       sendJson(res, 200, { messages: [] });
     }
+  }
+
+  /** The entry, or null when it does not exist or belongs to another project. */
+  async function findDlqEntry(ctx: RouteContext, messageId: string): Promise<DlqEntry | null> {
+    // Redis rejects a malformed stream id rather than matching nothing.
+    if (!/^\d+-\d+$/.test(messageId)) return null;
+    const rawEntries = await deps.redis.native.xrange(STREAMS.DEAD_LETTER, messageId, messageId);
+    if (!rawEntries || rawEntries.length === 0 || !rawEntries[0]) return null;
+    const entry = parseDlqEntry(rawEntries[0][0], rawEntries[0][1]);
+    if (ctx.projectId && entry.projectId !== ctx.projectId) return null;
+    return entry;
   }
 
   // ── POST /v1/dlq/replay — replayDLQMessage ────────────────────────────────
@@ -1284,46 +1440,35 @@ export function createHandlers(deps: Deps) {
     }
 
     try {
-      const rawEntries = await deps.redis.native.xrange(STREAMS.DEAD_LETTER, messageId, messageId);
-      if (!rawEntries || rawEntries.length === 0 || !rawEntries[0]) {
+      const entry = await findDlqEntry(ctx, messageId);
+      if (!entry) {
         sendJson(res, 404, { error: "dlq_message_not_found" });
         return;
       }
 
-      const fields = rawEntries[0][1];
-      const fieldMap: Record<string, string> = {};
-      for (let i = 0; i < fields.length; i += 2) {
-        fieldMap[fields[i]!] = fields[i + 1]!;
-      }
-
-      let payload: any = null;
-      if (fieldMap.payload) {
-        try {
-          payload = JSON.parse(fieldMap.payload);
-        } catch {}
-      }
-
-      if (ctx.projectId) {
-        const pId = payload?.projectId ?? payload?.project_id ?? (fieldMap as any).projectId;
-        if (pId !== ctx.projectId) {
-          sendJson(res, 404, { error: "dlq_message_not_found" });
-          return;
-        }
-      }
-
-      const priority = fieldMap.priority || "normal";
-      const p = getPriorityBucket(priority);
+      // Back onto the stream it failed on: a failed send belongs with delivery,
+      // not at the start of the pipeline, where its payload does not parse.
+      const replayable = new Set<string>(Object.values(STREAMS));
+      replayable.delete(STREAMS.DEAD_LETTER);
+      const inbound =
+        STREAMS[
+          `INBOUND_${getPriorityBucket(entry.payload?.priority ?? entry.fields.priority).toUpperCase()}` as keyof typeof STREAMS
+        ] ?? STREAMS.INBOUND_NORMAL;
       const targetStream =
-        STREAMS[`INBOUND_${p.toUpperCase()}` as keyof typeof STREAMS] || STREAMS.INBOUND_NORMAL;
+        entry.originalStream && replayable.has(entry.originalStream)
+          ? entry.originalStream
+          : inbound;
 
       const xaddArgs: string[] = [];
-      for (const [k, v] of Object.entries(fieldMap)) {
-        xaddArgs.push(k, v);
+      if (entry.event) {
+        xaddArgs.push("data", JSON.stringify(entry.event));
+      } else {
+        for (const [k, v] of Object.entries(entry.fields)) xaddArgs.push(k, v);
       }
       await deps.redis.native.xadd(targetStream, "*", ...xaddArgs);
       await deps.redis.native.xdel(STREAMS.DEAD_LETTER, messageId);
 
-      sendJson(res, 200, { success: true, replayedId: messageId });
+      sendJson(res, 200, { success: true, replayedId: messageId, stream: targetStream });
     } catch (err: any) {
       sendJson(res, 500, { error: "replay_failed", message: err.message });
     }
@@ -1339,34 +1484,10 @@ export function createHandlers(deps: Deps) {
     if (!messageId) return sendJson(res, 400, { error: "missing_id" });
 
     try {
-      if (ctx.projectId) {
-        const rawEntries = await deps.redis.native.xrange(
-          STREAMS.DEAD_LETTER,
-          messageId,
-          messageId,
-        );
-        if (!rawEntries || rawEntries.length === 0 || !rawEntries[0]) {
-          sendJson(res, 404, { error: "dlq_message_not_found" });
-          return;
-        }
-        const fields = rawEntries[0][1];
-        const fieldMap: Record<string, string> = {};
-        for (let i = 0; i < fields.length; i += 2) {
-          fieldMap[fields[i]!] = fields[i + 1]!;
-        }
-        let payload: any = null;
-        if (fieldMap.payload) {
-          try {
-            payload = JSON.parse(fieldMap.payload);
-          } catch {}
-        }
-        const pId = payload?.projectId ?? payload?.project_id ?? (fieldMap as any).projectId;
-        if (pId !== ctx.projectId) {
-          sendJson(res, 404, { error: "dlq_message_not_found" });
-          return;
-        }
+      if (!(await findDlqEntry(ctx, messageId))) {
+        sendJson(res, 404, { error: "dlq_message_not_found" });
+        return;
       }
-
       await deps.redis.native.xdel(STREAMS.DEAD_LETTER, messageId);
       sendJson(res, 200, { success: true });
     } catch (err: any) {
@@ -1766,10 +1887,13 @@ code{background:#f4f4f5;padding:.1rem .35rem;border-radius:4px}</style>
 
       if (ENGAGEMENT.includes(row.kind as Engagement)) {
         bucket[row.kind as Engagement] += n;
-      } else {
-        // A delivery row. `sent` is every task that reached a provider at all,
-        // which is the denominator a bounce rate is measured against.
+      } else if (row.kind === "dispatched") {
+        // `sent` is every task that reached a provider at all, which is the
+        // denominator a bounce rate is measured against. Each attempt logs a
+        // dispatched row besides its outcome row, and the two are grouped
+        // separately, so counting both counted every message twice.
         bucket.sent += n;
+      } else {
         if (row.status === "delivered") bucket.delivered += n;
         if (row.status === "failed") bucket.failed += n;
       }

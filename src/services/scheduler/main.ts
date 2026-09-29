@@ -11,16 +11,18 @@ import {
   buildStreamEvent,
   type NotificationScheduledPayload,
 } from "@/index.js";
-import { getPriorityBucket, type WorkerOptions } from "@/shared/index.js";
+import { getPriorityBucket, globalEmitter, type WorkerOptions } from "@/shared/index.js";
 import { scheduledPayloads } from "@/db/schema.js";
-import { asc, gt, inArray } from "drizzle-orm";
+import { and, asc, eq, gt, inArray, or, sql as drizzleSql } from "drizzle-orm";
 import { startHealthReporter } from "@/workers/index.js";
 import {
   createPriorityProducers,
   createStreamConsumer,
   createWorkerRuntime,
   shutdownWorker,
+  uniqueConsumerId,
 } from "@/workers/bootstrap.js";
+import { findBlockedAtRelease } from "./send-gate.js";
 // ─── Bootstrap ─────────────────────────────────────────────────────────────
 
 loadEnv();
@@ -137,6 +139,11 @@ export async function executeSchedulerPoll(
       .where(inArray(scheduledPayloads.taskId, taskIds));
     const payloadMap = new Map(dbPayloads.map((row: any) => [row.taskId, row.payload]));
 
+    // What the person did while this sat parked still applies. A failed
+    // lookup throws to the catch below: the claimed tasks reappear after the
+    // visibility timeout instead of going out unchecked.
+    const blocked = await findBlockedAtRelease(db, [...payloadMap.values()] as any[]);
+
     const batchedEvents: Record<"critical" | "normal" | "low", Omit<any, "id" | "timestamp">[]> = {
       critical: [],
       normal: [],
@@ -170,6 +177,23 @@ export async function executeSchedulerPoll(
       }
 
       const dispatchPayload = payload as any;
+
+      const blockReason = blocked.get(taskId);
+      if (blockReason) {
+        logger.info({ taskId, reason: blockReason }, "parked send no longer allowed — dropping");
+        globalEmitter.emit("notification:skipped", {
+          projectId: dispatchPayload.projectId,
+          eventId: dispatchPayload.enrichedEventId,
+          recipientId: dispatchPayload.recipientId,
+          reason: blockReason,
+        });
+        released.add(taskId);
+        dbCleanupIds.push(taskId);
+        const shard = parseInt(taskId.slice(-1), 16) || 0;
+        cleanupPipeline.zrem(`notif:scheduled:zset:${shard}`, taskStr);
+        continue;
+      }
+
       const p = getPriorityBucket(dispatchPayload.priority);
 
       batchedEvents[p].push(
@@ -194,7 +218,24 @@ export async function executeSchedulerPoll(
 
     if (dbCleanupIds.length > 0) {
       try {
-        await db.delete(scheduledPayloads).where(inArray(scheduledPayloads.taskId, dbCleanupIds));
+        // Only the payload that was released. By now delivery may have
+        // throttled the task and parked it again under the same id with a
+        // later send time; deleting by id alone removed that newer payload,
+        // and its ZSET entry was then dropped as canceled — the send was lost.
+        const sendAt = drizzleSql`${scheduledPayloads.payload}->>'scheduledAt'`;
+        await db.delete(scheduledPayloads).where(
+          or(
+            ...dbCleanupIds.map((taskId) => {
+              const released = (payloadMap.get(taskId) as any)?.scheduledAt;
+              return and(
+                eq(scheduledPayloads.taskId, taskId),
+                typeof released === "string"
+                  ? drizzleSql`${sendAt} = ${released}`
+                  : drizzleSql`${sendAt} IS NULL`,
+              );
+            }),
+          ),
+        );
       } catch (err) {
         logger.error(
           { err },
@@ -284,7 +325,7 @@ export async function startSchedulerWorker() {
     {
       stream: STREAMS.SCHEDULED,
       group: CONSUMER_GROUPS.SCHEDULER,
-      consumer: `scheduler-${process.pid}`,
+      consumer: uniqueConsumerId("scheduler"),
       batchSize: config.WORKER_CONCURRENCY,
     },
   ));

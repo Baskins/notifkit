@@ -32,5 +32,7 @@ export const NotificationRequestedPayloadSchema = z.object({
    * reported on afterwards. Carried unchanged to the delivery log.
    */
   campaignId: z.string().min(1).max(128).optional(),
+  /** Set by the workflow worker on a step's notify, carried to the delivery log. */
+  workflowInstanceId: z.string().uuid().optional(),
 });
 export type NotificationRequestedPayload = z.infer<typeof NotificationRequestedPayloadSchema>;

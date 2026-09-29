@@ -308,24 +308,25 @@ export class ApiRateLimiter {
     }
 
     // 2. Slow Path: tokens are depleted, block on the in-flight lease or start one.
-    // Multiple concurrent requests racing here all join the *same* promise so
-    // only one Redis round trip happens.  After it resolves each waiter tries to
-    // claim exactly one token — if they lose the race they're rate-limited.
-    if (!state.inFlightLease) {
-      this.refill(projectId, state, limitRpm, nowMs, currentBucket).catch(() => {});
-    }
+    // Concurrent requests racing here all join the *same* promise so one Redis
+    // round trip serves them. A lease only grants `batchSize` tokens, so a
+    // burst larger than that leases again rather than rejecting requests the
+    // window still has room for: a request is refused only once Redis itself
+    // reports the window spent.
+    for (;;) {
+      if (!state.inFlightLease) {
+        this.refill(projectId, state, limitRpm, nowMs, currentBucket).catch(() => {});
+      }
+      const granted = state.inFlightLease ? await state.inFlightLease : 0;
 
-    if (state.inFlightLease) {
-      await state.inFlightLease;
+      // Only claim a token if the lease came back for the same bucket we waited on.
+      if (state.bucketIndex !== currentBucket) return false;
+      if (state.tokens > 0) {
+        state.tokens--;
+        return true;
+      }
+      if (granted <= 0) return false;
     }
-
-    // Only claim a token if the lease came back for the same bucket we waited on.
-    if (state.bucketIndex === currentBucket && state.tokens > 0) {
-      state.tokens--;
-      return true;
-    }
-
-    return false;
   }
 
   private async refill(

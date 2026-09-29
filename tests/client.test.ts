@@ -2,16 +2,13 @@ import { describe, it, expect, vi, afterEach } from "vitest";
 import { NotifkitClient } from "@/client.js";
 
 /**
- * Stubs `fetch` with a minimal Response double. `status` drives `ok` unless it
- * is given explicitly, which lets the error-path tests cover a 4xx that still
- * carries a JSON body.
+ * Stubs `fetch` with a real `Response` carrying `body` as JSON, so the client
+ * reads it the way it reads a server's. The request/response round trip itself
+ * is covered against a running server in tests/integration/api.test.ts; these
+ * pin down what the client puts on the wire.
  */
 function stubFetch(body: unknown, status = 200) {
-  const fn = vi.fn().mockResolvedValue({
-    status,
-    ok: status >= 200 && status < 300,
-    json: async () => body,
-  });
+  const fn = vi.fn().mockImplementation(async () => new Response(JSON.stringify(body), { status }));
   vi.stubGlobal("fetch", fn);
   return fn;
 }
@@ -76,16 +73,18 @@ describe("NotifkitClient", () => {
     });
 
     it("returns undefined on 204 without parsing a body", async () => {
-      const fetchMock = vi.fn().mockResolvedValue({
-        status: 204,
-        ok: true,
-        json: async () => {
-          throw new Error("204 responses have no body to parse");
-        },
-      });
-      vi.stubGlobal("fetch", fetchMock);
-
+      vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(null, { status: 204 })));
       await expect(client().deleteUser("usr_1")).resolves.toBeUndefined();
+    });
+
+    it("reports the status when an error response is not JSON", async () => {
+      vi.stubGlobal(
+        "fetch",
+        vi.fn().mockResolvedValue(new Response("<html>Bad Gateway</html>", { status: 502 })),
+      );
+      await expect(client().addUser({ id: "usr_1" })).rejects.toThrow(
+        "Request failed with status 502",
+      );
     });
 
     it("sends no body when none is supplied", async () => {

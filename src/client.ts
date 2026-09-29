@@ -22,6 +22,7 @@ import type {
   SuppressionRecord,
   ProjectRecord,
   ProjectKeyRecord,
+  CreatedProjectKeyRecord,
   SystemHealthRecord,
   SystemMetricsRecord,
   DLQMessageRecord,
@@ -61,10 +62,17 @@ export class NotifkitClient {
       return undefined as T;
     }
 
-    const data = await res.json();
+    const text = await res.text();
+    let data: unknown;
+    try {
+      data = text ? JSON.parse(text) : undefined;
+    } catch {
+      // Not JSON: an HTML error page, or a proxy in front of the API.
+      data = undefined;
+    }
     if (!res.ok) {
-      const errorMsg =
-        (data as any).message || (data as any).error || `Request failed with status ${res.status}`;
+      const body = data as { message?: string; error?: string } | undefined;
+      const errorMsg = body?.message || body?.error || `Request failed with status ${res.status}`;
       throw new Error(errorMsg);
     }
     return data as T;
@@ -285,7 +293,7 @@ export class NotifkitClient {
   async createProjectKey(
     id: string,
     input?: { role?: "admin" | "read_only" },
-  ): Promise<ProjectKeyRecord> {
+  ): Promise<CreatedProjectKeyRecord> {
     return this.request(`/v1/projects/${encodeURIComponent(id)}/keys`, "POST", input || {});
   }
 
@@ -472,7 +480,9 @@ export class NotifkitClient {
   }
 
   /** Replay a dead-letter queue message. */
-  async replayDLQMessage(id: string): Promise<{ success: boolean; replayedId: string }> {
+  async replayDLQMessage(
+    id: string,
+  ): Promise<{ success: boolean; replayedId: string; stream: string }> {
     return this.request("/v1/dlq/replay", "POST", { id });
   }
 

@@ -380,6 +380,19 @@ describe("API compliance handlers", () => {
   describe("getCampaignStats", () => {
     const statsCtx = (campaign = "spring-sale") => ctx({ params: { campaign } });
 
+    /**
+     * The grouped rows the stats query returns for `sent` tasks on a channel,
+     * shaped like the real delivery log: every attempt writes a `dispatched`
+     * row and then an `attempt` row carrying its outcome.
+     */
+    const sends = (channel: string, delivered: number, failed = 0) => [
+      { channel, kind: "dispatched", status: "dispatched", tasks: String(delivered + failed) },
+      ...(delivered
+        ? [{ channel, kind: "attempt", status: "delivered", tasks: String(delivered) }]
+        : []),
+      ...(failed ? [{ channel, kind: "attempt", status: "failed", tasks: String(failed) }] : []),
+    ];
+
     it("400s when no campaign is named", async () => {
       const res = createMockRes();
       await handlers.getCampaignStats(createMockReq(), res, ctx({ params: {} }));
@@ -399,10 +412,7 @@ describe("API compliance handlers", () => {
     });
 
     it("splits delivery rows into sent, delivered and failed", async () => {
-      mockDb.queueSelect([
-        { channel: "email", kind: "delivery", status: "delivered", tasks: "90" },
-        { channel: "email", kind: "delivery", status: "failed", tasks: "10" },
-      ]);
+      mockDb.queueSelect(sends("email", 90, 10));
       const res = createMockRes();
 
       await handlers.getCampaignStats(createMockReq(), res, statsCtx());
@@ -416,7 +426,7 @@ describe("API compliance handlers", () => {
 
     it("counts engagement kinds separately from the send total", async () => {
       mockDb.queueSelect([
-        { channel: "email", kind: "delivery", status: "delivered", tasks: "100" },
+        ...sends("email", 100),
         { channel: "email", kind: "opened", status: "opened", tasks: "40" },
         { channel: "email", kind: "clicked", status: "clicked", tasks: "10" },
       ]);
@@ -434,7 +444,7 @@ describe("API compliance handlers", () => {
 
     it("rounds a rate to two decimals", async () => {
       mockDb.queueSelect([
-        { channel: "email", kind: "delivery", status: "delivered", tasks: "3" },
+        ...sends("email", 3),
         { channel: "email", kind: "opened", status: "opened", tasks: "1" },
       ]);
       const res = createMockRes();
@@ -445,7 +455,7 @@ describe("API compliance handlers", () => {
     });
 
     it("reports a rate as null, not zero, when its denominator is zero", async () => {
-      mockDb.queueSelect([{ channel: "email", kind: "delivery", status: "failed", tasks: "5" }]);
+      mockDb.queueSelect(sends("email", 0, 5));
       const res = createMockRes();
 
       await handlers.getCampaignStats(createMockReq(), res, statsCtx());
@@ -458,11 +468,7 @@ describe("API compliance handlers", () => {
     });
 
     it("breaks the funnel down per channel and totals across them", async () => {
-      mockDb.queueSelect([
-        { channel: "email", kind: "delivery", status: "delivered", tasks: "50" },
-        { channel: "sms", kind: "delivery", status: "delivered", tasks: "30" },
-        { channel: "sms", kind: "delivery", status: "failed", tasks: "20" },
-      ]);
+      mockDb.queueSelect([...sends("email", 50), ...sends("sms", 30, 20)]);
       const res = createMockRes();
 
       await handlers.getCampaignStats(createMockReq(), res, statsCtx());
@@ -476,7 +482,7 @@ describe("API compliance handlers", () => {
     });
 
     it("warns that opens are untracked rather than zero on a channel that cannot report them", async () => {
-      mockDb.queueSelect([{ channel: "sms", kind: "delivery", status: "delivered", tasks: "10" }]);
+      mockDb.queueSelect(sends("sms", 10));
       const res = createMockRes();
 
       await handlers.getCampaignStats(createMockReq(), res, statsCtx());
@@ -487,9 +493,7 @@ describe("API compliance handlers", () => {
     });
 
     it("warns when email was delivered but no engagement ever arrived", async () => {
-      mockDb.queueSelect([
-        { channel: "email", kind: "delivery", status: "delivered", tasks: "10" },
-      ]);
+      mockDb.queueSelect(sends("email", 10));
       const res = createMockRes();
 
       await handlers.getCampaignStats(createMockReq(), res, statsCtx());
@@ -501,7 +505,7 @@ describe("API compliance handlers", () => {
 
     it("stays quiet when engagement is both possible and present", async () => {
       mockDb.queueSelect([
-        { channel: "email", kind: "delivery", status: "delivered", tasks: "10" },
+        ...sends("email", 10),
         { channel: "email", kind: "opened", status: "opened", tasks: "4" },
       ]);
       const res = createMockRes();

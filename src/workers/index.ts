@@ -220,7 +220,7 @@ export abstract class BaseWorker {
           { err, eventId: event.id },
           "non-retryable error on inline message — moving to dead-letter queue",
         );
-        await this.consumer.deadLetter(event);
+        await this.consumer.deadLetter(event, (err as Error).message);
         globalEmitter.emit("notification:failed", event.id, (err as Error).message, event.type);
         return;
       }
@@ -239,7 +239,12 @@ export abstract class BaseWorker {
           { messageId: message.id, retryCount },
           "max retries exceeded, moving to dead-letter queue",
         );
-        await this.consumer.nack(message.id, message.event, stream);
+        await this.consumer.nack(
+          message.id,
+          message.event,
+          stream,
+          `max retries exceeded (${retryCount - 1} attempts)`,
+        );
         globalEmitter.emit(
           "notification:failed",
           message.id,
@@ -285,7 +290,7 @@ export abstract class BaseWorker {
           { err, messageId: message.id },
           "non-retryable error encountered, immediately moving to dead-letter queue without retry loop",
         );
-        await this.consumer.nack(message.id, message.event, stream);
+        await this.consumer.nack(message.id, message.event, stream, (err as Error).message);
         globalEmitter.emit(
           "notification:failed",
           message.id,

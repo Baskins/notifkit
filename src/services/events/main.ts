@@ -14,7 +14,12 @@ import { workflowWaiters, workflowSteps, workflowInstances } from "@/db/schema.j
 import { eq, and, or, isNull, gt } from "drizzle-orm";
 import { type WorkerOptions } from "@/shared/index.js";
 import { startHealthReporter } from "@/workers/index.js";
-import { createStreamConsumer, createWorkerRuntime, shutdownWorker } from "@/workers/bootstrap.js";
+import {
+  createStreamConsumer,
+  createWorkerRuntime,
+  shutdownWorker,
+  uniqueConsumerId,
+} from "@/workers/bootstrap.js";
 
 loadEnv();
 const config = readBaseConfig();
@@ -376,7 +381,7 @@ export async function startEventWorker() {
     {
       stream: STREAMS.EVENTS_INBOUND,
       group: CONSUMER_GROUPS.EVENTS,
-      consumer: `events-${process.pid}`,
+      consumer: uniqueConsumerId("events"),
       batchSize: eventsConcurrency,
       bufferAcks: true,
       // Log rows are not latency-sensitive; let reads fill up.

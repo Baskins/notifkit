@@ -302,24 +302,17 @@ export function registerTools(server: McpServer, api: NotifkitApi): void {
         if (seen.has(target)) continue;
         seen.add(target);
 
-        let userRecord: Record<string, unknown>;
-        if (channel === "email") {
-          userRecord = { id: `email:${target}`, email: target };
-        } else if (channel === "sms") {
-          userRecord = { id: `phone:${target}`, phone: target };
-        } else if (channel === "push") {
-          userRecord = { id: `push:${target}`, pushToken: target };
-        } else if (channel === "telegram") {
-          userRecord = { id: `telegram:${target}` };
-        } else if (channel === "discord") {
-          userRecord = { id: `discord:${target}` };
-        } else if (channel === "whatsapp") {
-          userRecord = { id: `whatsapp:${target}`, phone: target };
-        } else if (channel === "slack") {
-          userRecord = { id: `slack:${target}` };
-        } else {
-          userRecord = { id: `webhook:${target}` };
-        }
+        // Every channel needs a contact on that channel to be reached. Chat
+        // channels used to get a bare user record, and WhatsApp a phone
+        // number filed as an SMS contact, so those campaigns sent nothing.
+        const userRecord: Record<string, unknown> =
+          channel === "email"
+            ? { id: `email:${target}`, email: target }
+            : channel === "sms"
+              ? { id: `phone:${target}`, phone: target }
+              : channel === "push"
+                ? { id: `push:${target}`, pushToken: target }
+                : { id: `${channel}:${target}`, contacts: [{ channel, target }] };
         recipients.push(userRecord);
       }
 

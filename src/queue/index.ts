@@ -96,12 +96,14 @@ export class StreamProducer {
   }
 
   async publish(partial: Omit<StreamEvent, "id" | "timestamp">): Promise<string> {
-    const event: StreamEvent = {
+    return this.enqueue({
       ...partial,
       id: crypto.randomUUID(),
       timestamp: new Date().toISOString(),
-    };
+    });
+  }
 
+  private enqueue(event: StreamEvent): Promise<string> {
     return new Promise<string>((resolve, reject) => {
       this.pendingQueue.push({ event, resolve, reject });
       if (this.pendingQueue.length >= 100) {
@@ -209,13 +211,15 @@ export class StreamProducer {
   ): Promise<{ messageIds: string[]; eventIds: string[] }> {
     if (partials.length === 0) return { messageIds: [], eventIds: [] };
 
+    // The ids returned must be the ids the events are written with: callers
+    // record them as notification ids.
     const eventIds: string[] = [];
     const promises: Promise<string>[] = [];
 
     for (const partial of partials) {
       const id = crypto.randomUUID();
       eventIds.push(id);
-      promises.push(this.publish(partial));
+      promises.push(this.enqueue({ ...partial, id, timestamp: new Date().toISOString() }));
     }
 
     const messageIds = await Promise.all(promises);
@@ -472,7 +476,7 @@ export class StreamConsumer {
    * against this consumer's stream so a replay lands where it would have been
    * read from.
    */
-  async deadLetter(event: StreamEvent): Promise<void> {
+  async deadLetter(event: StreamEvent, reason?: string): Promise<void> {
     if (!this.dlqStream) {
       this.logger?.error(
         { eventId: event.id },
@@ -486,12 +490,17 @@ export class StreamConsumer {
       "data",
       JSON.stringify({
         ...event,
-        dlq: { originalStream: this.streams[0]!, ackedAt: new Date().toISOString() },
+        dlq: { originalStream: this.streams[0]!, ackedAt: new Date().toISOString(), reason },
       }),
     );
   }
 
-  async nack(messageId: string, event: StreamEvent, stream?: string): Promise<void> {
+  async nack(
+    messageId: string,
+    event: StreamEvent,
+    stream?: string,
+    reason?: string,
+  ): Promise<void> {
     const s = stream ?? this.streams[0]!;
     if (this.dlqStream) {
       // Sequential rather than pipelined, and in this order: the ack is what
@@ -506,7 +515,7 @@ export class StreamConsumer {
         "data",
         JSON.stringify({
           ...event,
-          dlq: { originalStream: s, ackedAt: new Date().toISOString() },
+          dlq: { originalStream: s, ackedAt: new Date().toISOString(), reason },
         }),
       );
 

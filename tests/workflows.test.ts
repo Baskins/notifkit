@@ -296,8 +296,10 @@ describe("Workflow Engine Edge Cases", () => {
     expect(mockDb.set).toHaveBeenLastCalledWith({ status: "completed" });
   });
 
-  it("handles step.waitForEvent timeout (returns null)", async () => {
-    // 3rd run: waking up from waitForEvent timeout
+  it("goes back to sleep when resumed before the awaited event or its timeout", async () => {
+    // A resume with the step still unfilled — no event recorded, no timeout —
+    // is spurious (a duplicate trigger, a replayed message). A real timeout
+    // writes { timedOut: true }; see the next test.
     const msg: StreamMessage = {
       id: "5-0",
       event: {
@@ -332,13 +334,9 @@ describe("Workflow Engine Edge Cases", () => {
 
     await worker.process(msg);
 
-    // Should NOT have published the success notification
     expect(mockNotificationProducer.publish).not.toHaveBeenCalled();
-    // But should have completed
-    expect(mockDb.update).toHaveBeenCalled();
-    // Wait, mockDb.set could be called multiple times now (first running, then completed)
-    // We expect the LAST call to be completed
-    expect(mockDb.set).toHaveBeenLastCalledWith({ status: "completed" });
+    // Suspended again rather than carrying on as if the wait had timed out.
+    expect(mockDb.set).toHaveBeenLastCalledWith({ status: "pending" });
   });
 
   it("handles step.waitForEvent when persisted step output is { timedOut: true }", async () => {

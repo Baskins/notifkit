@@ -15,6 +15,7 @@ import {
   registry,
   buildStreamEvent,
   type NotificationDispatchedPayload,
+  type DispatchedTaskPayload,
   type RenderedContent,
   PUBSUB_CHANNELS,
 } from "@/index.js";
@@ -72,6 +73,37 @@ let subscriber: Redis | null = null;
 
 /** How long a send may run before its dispatched log entry is published alone. */
 const DISPATCH_LOG_DELAY_MS = 1_000;
+
+/**
+ * Wait before re-trying a send that failed at the provider, by prior failures.
+ * The first step matches the circuit breaker's reset timeout, so a retry of a
+ * task the open breaker turned away reaches the provider's recovery probe
+ * rather than the same closed door.
+ */
+const RETRY_BACKOFF_MS = [30_000, 120_000, 600_000];
+
+/**
+ * Names the provider at `transports[i]` for its rate limit and circuit breaker.
+ * The rate limit's budget lives in Redis and is shared by every delivery
+ * process, so the name must come out the same everywhere: the class name,
+ * numbered when a channel has two providers of one class.
+ */
+function providerKey(channel: string, transports: any[], i: number): string {
+  const name = transports[i].constructor?.name ?? "provider";
+  const nth = transports.slice(0, i).filter((t) => t.constructor?.name === name).length;
+  return nth === 0 ? `${channel}:${name}` : `${channel}:${name}#${nth + 1}`;
+}
+
+/** A provider's refusal, keeping whether it said another attempt could work. */
+function providerFailure(res: { error?: string; retryable?: boolean }): Error {
+  const err = new Error(res.error ?? "Transport failed");
+  (err as any).retryable = res.retryable;
+  return err;
+}
+
+export function retryDelayMs(priorFailures: number): number {
+  return RETRY_BACKOFF_MS[Math.min(priorFailures, RETRY_BACKOFF_MS.length - 1)]!;
+}
 
 export interface DeliveryWorkerOptions extends WorkerOptions {
   transportRegistry: any;
@@ -196,6 +228,51 @@ export class DeliveryWorker extends BaseWorker {
     return renderWithTemplate(template, task.templateVariables);
   }
 
+  /**
+   * Parks a task in Postgres and the scheduler until `sendAt`. The payload
+   * carries the send time, so the scheduler can rebuild it if Redis loses its
+   * data.
+   */
+  private async reschedule(
+    task: DispatchedTaskPayload,
+    sendAt: Date,
+    reason: string,
+  ): Promise<void> {
+    const scheduledAt = sendAt.toISOString();
+    await this.db
+      .insert(scheduledPayloads)
+      .values({ taskId: task.taskId, payload: { ...task, scheduledAt } })
+      .onConflictDoUpdate({
+        target: scheduledPayloads.taskId,
+        set: { payload: drizzleSql`EXCLUDED.payload` },
+      });
+
+    await this.scheduledProducer.publish(
+      buildStreamEvent(
+        "notification.scheduled",
+        {
+          projectId: task.projectId,
+          enrichedEventId: task.enrichedEventId,
+          taskId: task.taskId,
+          scheduledAt,
+        },
+        "delivery",
+        `${task.taskId}:${reason}:${Date.now()}`,
+      ),
+    );
+  }
+
+  /** Takes a slot from the provider's rate limit, if it has one. */
+  private async providerGate(
+    channel: string,
+    transports: any[],
+    i: number,
+  ): Promise<{ allowed: boolean; retryAfterMs: number }> {
+    const limits = transports[i].limits;
+    if (!limits) return { allowed: true, retryAfterMs: 0 };
+    return this.providerThrottle.check(providerKey(channel, transports, i), limits);
+  }
+
   private getBreaker(name: string): CircuitBreaker {
     let breaker = this.breakers.get(name);
     if (!breaker) {
@@ -219,6 +296,11 @@ export class DeliveryWorker extends BaseWorker {
     }
 
     const task = payloadResult.data as NotificationDispatchedPayload;
+    // Attempts made on earlier trips through the scheduler, plus this one.
+    const attemptNo = (task.deliveryAttemptCount ?? 0) + attempt;
+    // What gets parked for a retry: the task as it arrived, before rendering
+    // and the transport's abort signal were attached to it.
+    const original: DispatchedTaskPayload = { ...task };
 
     const fallbackToNextChannel = async (reason: string) => {
       if (task.fallbackChain && task.fallbackChain.length > 0 && task.recipient) {
@@ -238,6 +320,9 @@ export class DeliveryWorker extends BaseWorker {
           recipient: task.recipient,
           scheduledAt: undefined,
           fallbackChain: remainingChain.length > 0 ? remainingChain : undefined,
+          campaignId: task.campaignId,
+          workflowInstanceId: task.workflowInstanceId,
+          throttleCounted: true,
         };
 
         const p = getPriorityBucket(task.priority);
@@ -288,10 +373,9 @@ export class DeliveryWorker extends BaseWorker {
               failureReason: "no transport registered for channel",
               failureCode: "no_transport",
               retryable: false,
-              attempt,
+              attempt: attemptNo,
               templateId: task.templateId,
-              workflowInstanceId:
-                event.metadata.source === "workflow" ? event.metadata.traceId : undefined,
+              workflowInstanceId: task.workflowInstanceId,
               campaignId: task.campaignId,
             },
             "delivery",
@@ -302,87 +386,67 @@ export class DeliveryWorker extends BaseWorker {
       return;
     }
 
-    const limitConfig = transports[0].limits;
-    if (limitConfig) {
-      const { allowed, retryAfterMs } = await this.providerThrottle.check(
-        task.channel,
-        limitConfig,
-      );
-      if (!allowed) {
-        task.throttleAttemptCount = (task.throttleAttemptCount ?? 0) + 1;
-        const maxAttempts = task.deliveryOptions?.maxAttempts ?? 3;
+    // Each provider has its own budget: start at the first with room left. The
+    // channel is out of capacity only once every provider for it is.
+    let startAt = -1;
+    let retryAfterMs = Infinity;
+    for (let i = 0; i < transports.length; i++) {
+      const gate = await this.providerGate(task.channel, transports, i);
+      if (gate.allowed) {
+        startAt = i;
+        break;
+      }
+      retryAfterMs = Math.min(retryAfterMs, gate.retryAfterMs);
+    }
+    if (startAt === -1) {
+      task.throttleAttemptCount = (task.throttleAttemptCount ?? 0) + 1;
+      const maxAttempts = task.deliveryOptions?.maxAttempts ?? 3;
 
-        if (task.throttleAttemptCount > maxAttempts) {
-          this.logger.warn(
-            { messageId: message.id, taskId: task.taskId, attempts: task.throttleAttemptCount },
-            "provider rate limit max attempts exceeded",
-          );
-          const fallbackTriggered = await fallbackToNextChannel("provider_throttle_exceeded");
-          if (!fallbackTriggered) {
-            this.globalEmitter.emit(
-              "delivery:failed",
-              task.taskId,
-              "provider throttle exceeded",
-              task.channel,
-              task.projectId,
-            );
-            await this.eventProcessor.add(
-              buildStreamEvent(
-                "notification.failed",
-                {
-                  projectId: task.projectId,
-                  taskId: task.taskId,
-                  enrichedEventId: task.enrichedEventId,
-                  recipientId: task.recipientId,
-                  channel: task.channel,
-                  failureReason: "provider rate limit max attempts exceeded",
-                  failureCode: "provider_throttle_exceeded",
-                  retryable: false,
-                  attempt,
-                  templateId: task.templateId,
-                  workflowInstanceId:
-                    event.metadata.source === "workflow" ? event.metadata.traceId : undefined,
-                  campaignId: task.campaignId,
-                },
-                "delivery",
-                event.metadata.traceId,
-              ),
-            );
-          }
-          return;
-        }
-
-        // The retry time rides in the payload so the scheduler can re-queue
-        // this from Postgres if Redis loses its data.
-        const retryAt = new Date(Date.now() + retryAfterMs).toISOString();
-        await this.db
-          .insert(scheduledPayloads)
-          .values({
-            taskId: task.taskId,
-            payload: { ...task, scheduledAt: retryAt },
-          })
-          .onConflictDoUpdate({
-            target: scheduledPayloads.taskId,
-            set: { payload: drizzleSql`EXCLUDED.payload` },
-          });
-
-        await this.scheduledProducer.publish(
-          buildStreamEvent(
-            "notification.scheduled",
-            {
-              projectId: task.projectId,
-              enrichedEventId: task.enrichedEventId,
-              taskId: task.taskId,
-              scheduledAt: retryAt,
-              throttleAttemptCount: task.throttleAttemptCount,
-            },
-            "delivery",
-            `${task.taskId}:throttle:${Date.now()}`,
-          ),
+      if (task.throttleAttemptCount > maxAttempts) {
+        this.logger.warn(
+          { messageId: message.id, taskId: task.taskId, attempts: task.throttleAttemptCount },
+          "provider rate limit max attempts exceeded",
         );
-
+        const fallbackTriggered = await fallbackToNextChannel("provider_throttle_exceeded");
+        if (!fallbackTriggered) {
+          this.globalEmitter.emit(
+            "delivery:failed",
+            task.taskId,
+            "provider throttle exceeded",
+            task.channel,
+            task.projectId,
+          );
+          await this.eventProcessor.add(
+            buildStreamEvent(
+              "notification.failed",
+              {
+                projectId: task.projectId,
+                taskId: task.taskId,
+                enrichedEventId: task.enrichedEventId,
+                recipientId: task.recipientId,
+                channel: task.channel,
+                failureReason: "provider rate limit max attempts exceeded",
+                failureCode: "provider_throttle_exceeded",
+                retryable: false,
+                attempt: attemptNo,
+                templateId: task.templateId,
+                workflowInstanceId: task.workflowInstanceId,
+                campaignId: task.campaignId,
+              },
+              "delivery",
+              event.metadata.traceId,
+            ),
+          );
+        }
         return;
       }
+
+      await this.reschedule(
+        { ...original, throttleAttemptCount: task.throttleAttemptCount },
+        new Date(Date.now() + retryAfterMs),
+        "throttle",
+      );
+      return;
     }
 
     const idempotencyKey = task.taskId;
@@ -433,9 +497,8 @@ export class DeliveryWorker extends BaseWorker {
             recipientId: task.recipientId,
             channel: task.channel,
             templateId: task.templateId,
-            attempt,
-            workflowInstanceId:
-              event.metadata.source === "workflow" ? event.metadata.traceId : undefined,
+            attempt: attemptNo,
+            workflowInstanceId: task.workflowInstanceId,
             campaignId: task.campaignId,
           },
           "delivery",
@@ -450,7 +513,40 @@ export class DeliveryWorker extends BaseWorker {
       clearTimeout(dispatchLogTimer);
       if (dispatchLogged) return payload;
       dispatchLogged = true;
-      return { ...payload, attempt, dispatchedAt };
+      return { ...payload, attempt: attemptNo, dispatchedAt };
+    };
+
+    let retryScheduled = false;
+    /**
+     * Re-queues a send the provider turned away, unless it said the failure is
+     * permanent or the task is out of attempts. An outage, a timeout or an open
+     * circuit is exactly what a later attempt can get past; failing the task
+     * outright turned every blip into lost mail. The attempt stays in the log as
+     * dispatched, and the task's outcome is whatever its last attempt comes to.
+     */
+    const retryLater = async (failure: { retryable?: boolean; error?: string }) => {
+      const maxAttempts = task.deliveryOptions?.maxAttempts ?? 3;
+      if (failure.retryable === false || attemptNo >= maxAttempts) return false;
+      const delayMs = retryDelayMs(task.deliveryAttemptCount ?? 0);
+      await this.reschedule(
+        { ...original, deliveryAttemptCount: attemptNo },
+        new Date(Date.now() + delayMs),
+        "retry",
+      );
+      retryScheduled = true;
+      metrics.deliveryFailed.inc({ channel: task.channel, reason: "retry_scheduled" });
+      this.logger.warn(
+        {
+          taskId: task.taskId,
+          channel: task.channel,
+          attempt: attemptNo,
+          maxAttempts,
+          delayMs,
+          error: failure.error,
+        },
+        "provider send failed — retrying later",
+      );
+      return true;
     };
 
     try {
@@ -469,7 +565,13 @@ export class DeliveryWorker extends BaseWorker {
       if (task.channel === "push") {
         let lastResult: any = { success: false, error: "No transports" };
 
-        for (const transport of transports) {
+        for (let i = startAt; i < transports.length; i++) {
+          const transport = transports[i];
+          // The starting provider's slot was taken above. Failing over to a
+          // later one spends that provider's own budget, or skips it if spent.
+          if (i > startAt && !(await this.providerGate(task.channel, transports, i)).allowed) {
+            continue;
+          }
           const elapsedMs = Date.now() - tDispatchStart;
           const remainingBudgetMs = Math.max(0, MAX_DISPATCH_BUDGET_MS - elapsedMs);
           if (remainingBudgetMs <= 0) {
@@ -484,7 +586,7 @@ export class DeliveryWorker extends BaseWorker {
 
           try {
             const tProv = Date.now();
-            const breaker = this.getBreaker(`${task.channel}:${transport.constructor.name}`);
+            const breaker = this.getBreaker(providerKey(task.channel, transports, i));
 
             lastResult = await breaker.execute(async () => {
               const controller = new AbortController();
@@ -504,7 +606,7 @@ export class DeliveryWorker extends BaseWorker {
                   }),
                 ]);
                 if (!res.success && !res.invalidToken) {
-                  throw new Error(res.error ?? "Transport failed");
+                  throw providerFailure(res);
                 }
                 return res;
               } finally {
@@ -515,7 +617,7 @@ export class DeliveryWorker extends BaseWorker {
             (global as any)._telemetry.provider += Date.now() - tProv;
             if (lastResult.success || lastResult.invalidToken) break;
           } catch (err: any) {
-            lastResult = { success: false, error: err.message };
+            lastResult = { success: false, error: err.message, retryable: err.retryable };
           }
         }
 
@@ -560,10 +662,9 @@ export class DeliveryWorker extends BaseWorker {
                   failureReason: "invalid_token",
                   failureCode: "push_failure",
                   retryable: false,
-                  attempt,
+                  attempt: attemptNo,
                   templateId: task.templateId,
-                  workflowInstanceId:
-                    event.metadata.source === "workflow" ? event.metadata.traceId : undefined,
+                  workflowInstanceId: task.workflowInstanceId,
                   campaignId: task.campaignId,
                 }),
                 "delivery",
@@ -614,8 +715,7 @@ export class DeliveryWorker extends BaseWorker {
                   deliveredAt: new Date().toISOString(),
                   providerMessageId,
                   templateId: task.templateId,
-                  workflowInstanceId:
-                    event.metadata.source === "workflow" ? event.metadata.traceId : undefined,
+                  workflowInstanceId: task.workflowInstanceId,
                   campaignId: task.campaignId,
                 }),
                 "delivery",
@@ -623,7 +723,7 @@ export class DeliveryWorker extends BaseWorker {
               ),
             ),
           );
-        } else {
+        } else if (!(await retryLater(lastResult))) {
           this.logger.warn(
             { taskId: task.taskId, error: lastResult.error },
             "push delivery failed",
@@ -659,10 +759,9 @@ export class DeliveryWorker extends BaseWorker {
                   failureReason: lastResult.error ?? "push delivery failed",
                   failureCode: "push_failure",
                   retryable: false,
-                  attempt,
+                  attempt: attemptNo,
                   templateId: task.templateId,
-                  workflowInstanceId:
-                    event.metadata.source === "workflow" ? event.metadata.traceId : undefined,
+                  workflowInstanceId: task.workflowInstanceId,
                   campaignId: task.campaignId,
                 }),
                 "delivery",
@@ -679,7 +778,13 @@ export class DeliveryWorker extends BaseWorker {
       } else {
         // Other channels (email, sms, webhook, whatsapp) use the pre-resolved destination
         let result: any = { success: false, error: "No transports" };
-        for (const transport of transports) {
+        for (let i = startAt; i < transports.length; i++) {
+          const transport = transports[i];
+          // The starting provider's slot was taken above. Failing over to a
+          // later one spends that provider's own budget, or skips it if spent.
+          if (i > startAt && !(await this.providerGate(task.channel, transports, i)).allowed) {
+            continue;
+          }
           const elapsedMs = Date.now() - tDispatchStart;
           const remainingBudgetMs = Math.max(0, MAX_DISPATCH_BUDGET_MS - elapsedMs);
           if (remainingBudgetMs <= 0) {
@@ -694,7 +799,7 @@ export class DeliveryWorker extends BaseWorker {
 
           try {
             const tProv = Date.now();
-            const breaker = this.getBreaker(`${task.channel}:${transport.constructor.name}`);
+            const breaker = this.getBreaker(providerKey(task.channel, transports, i));
 
             result = await breaker.execute(async () => {
               const controller = new AbortController();
@@ -714,7 +819,7 @@ export class DeliveryWorker extends BaseWorker {
                   }),
                 ]);
                 if (!res.success) {
-                  throw new Error(res.error ?? "Transport failed");
+                  throw providerFailure(res);
                 }
                 return res;
               } finally {
@@ -725,7 +830,7 @@ export class DeliveryWorker extends BaseWorker {
             (global as any)._telemetry.provider += Date.now() - tProv;
             if (result.success) break;
           } catch (err: any) {
-            result = { success: false, error: err.message };
+            result = { success: false, error: err.message, retryable: err.retryable };
           }
         }
 
@@ -763,8 +868,7 @@ export class DeliveryWorker extends BaseWorker {
                   deliveredAt: new Date().toISOString(),
                   providerMessageId,
                   templateId: task.templateId,
-                  workflowInstanceId:
-                    event.metadata.source === "workflow" ? event.metadata.traceId : undefined,
+                  workflowInstanceId: task.workflowInstanceId,
                   campaignId: task.campaignId,
                 }),
                 "delivery",
@@ -772,7 +876,7 @@ export class DeliveryWorker extends BaseWorker {
               ),
             ),
           );
-        } else {
+        } else if (!(await retryLater(result))) {
           publishPromises.push(
             this.outboxUpdateProcessor.add({
               taskId: task.taskId,
@@ -794,10 +898,9 @@ export class DeliveryWorker extends BaseWorker {
                   failureReason: result.error ?? "delivery failed completely",
                   failureCode: "provider_error",
                   retryable: false,
-                  attempt,
+                  attempt: attemptNo,
                   templateId: task.templateId,
-                  workflowInstanceId:
-                    event.metadata.source === "workflow" ? event.metadata.traceId : undefined,
+                  workflowInstanceId: task.workflowInstanceId,
                   campaignId: task.campaignId,
                 }),
                 "delivery",
@@ -807,7 +910,7 @@ export class DeliveryWorker extends BaseWorker {
           );
         }
 
-        if (!result.success) {
+        if (!result.success && !retryScheduled) {
           this.logger.warn(
             { taskId: task.taskId, channel: task.channel, error: result.error },
             "delivery failed completely across providers",
@@ -825,7 +928,7 @@ export class DeliveryWorker extends BaseWorker {
           if (!fallbackTriggered) {
             throw new NonRetryableError(result.error ?? "delivery failed");
           }
-        } else {
+        } else if (result.success) {
           this.logger.debug(
             { taskId: task.taskId, channel: task.channel, messageId: result.providerMessageId },
             "notification delivered",
@@ -845,9 +948,14 @@ export class DeliveryWorker extends BaseWorker {
       });
       const flushTime = Date.now() - tFlushStart;
 
-      void this.idempotency.markProcessed(idempotencyKey).catch((err: any) => {
-        this.logger.warn({ err, taskId: task.taskId }, "failed to upgrade idempotency TTL");
-      });
+      if (retryScheduled) {
+        // Released so the re-queued attempt can take the lease.
+        await this.idempotency.unmark(idempotencyKey).catch(() => {});
+      } else {
+        void this.idempotency.markProcessed(idempotencyKey).catch((err: any) => {
+          this.logger.warn({ err, taskId: task.taskId }, "failed to upgrade idempotency TTL");
+        });
+      }
 
       const t = ((global as any)._telemetry = (global as any)._telemetry || {
         count: 0,

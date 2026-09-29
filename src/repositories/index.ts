@@ -22,6 +22,8 @@ import {
   adminUsers,
 } from "@/db/schema.js";
 
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
 // ─── Domain types ───────────────────────────────────────────────────────────
 
 export interface UserProfile {
@@ -310,6 +312,12 @@ export class UserRepository {
   ): Promise<void> {
     if (usersList.length === 0) return;
 
+    // ON CONFLICT DO UPDATE rejects the whole statement when two proposed rows
+    // hit the same key, so an import naming one user twice failed outright.
+    // The last occurrence wins, as it would had they been sent one by one.
+    const uniqueUsers = [...new Map(usersList.map((u) => [u.userId, u])).values()];
+    const winners = new Set(uniqueUsers);
+
     let attempts = 0;
     while (attempts < 3) {
       try {
@@ -317,7 +325,7 @@ export class UserRepository {
           await tx
             .insert(users)
             .values(
-              usersList.map((u) => ({
+              uniqueUsers.map((u) => ({
                 projectId,
                 externalId: u.userId,
                 attributes: {
@@ -381,7 +389,12 @@ export class UserRepository {
               }
             }
 
-            if (u.preferences?.quietHours && u.preferences.quietHours.length > 0) {
+            // Quiet hours are replaced, not merged, so only the winning row counts.
+            if (
+              winners.has(u) &&
+              u.preferences?.quietHours &&
+              u.preferences.quietHours.length > 0
+            ) {
               for (const window of u.preferences.quietHours) {
                 quietHoursInserts.push({
                   userId: internalId,
@@ -438,7 +451,7 @@ export class UserRepository {
               });
           }
 
-          const usersWithQuietHours = usersList.filter(
+          const usersWithQuietHours = uniqueUsers.filter(
             (u) => u.preferences?.quietHours !== undefined,
           );
           const internalIdsToClearQuietHours = usersWithQuietHours
@@ -485,7 +498,8 @@ export class UserRepository {
     const attrs = {
       language: patch.language ?? existing.language,
       timezone: patch.timezone ?? existing.timezone,
-      email: patch.email ?? existing.email,
+      // `null` clears the email; only an absent field keeps the old one.
+      email: patch.email !== undefined ? patch.email : existing.email,
     };
 
     await this.db.transaction(async (tx) => {
@@ -588,11 +602,14 @@ export class UserRepository {
   ): Promise<{ users: UserProfile[]; nextCursor: string | null }> {
     const conditions = [eq(users.projectId, projectId)];
 
-    if (cursor) {
-      const cursorDate = new Date(parseInt(cursor, 10));
-      if (!isNaN(cursorDate.getTime())) {
-        conditions.push(drizzleSql`${users.createdAt} < ${cursorDate.toISOString()}`);
-      }
+    // The cursor is the id of the last row returned. Paging on created_at
+    // alone skipped rows: a bulk import writes every user in one transaction,
+    // so they share one created_at, and the millisecond cursor could not tell
+    // them apart. (created_at, id) is unique and ordered.
+    if (cursor && UUID_RE.test(cursor)) {
+      conditions.push(
+        drizzleSql`(${users.createdAt}, ${users.id}) < (SELECT c.created_at, c.id FROM ${users} c WHERE c.id = ${cursor})`,
+      );
     }
 
     if (filters?.language) {
@@ -626,7 +643,7 @@ export class UserRepository {
       .select()
       .from(users)
       .where(and(...conditions))
-      .orderBy(desc(users.createdAt))
+      .orderBy(desc(users.createdAt), desc(users.id))
       .limit(limit);
 
     const items = rows.map((r) => {
@@ -640,8 +657,7 @@ export class UserRepository {
       };
     });
 
-    const nextCursor =
-      items.length === limit ? items[items.length - 1]!.createdAt.toString() : null;
+    const nextCursor = rows.length === limit ? rows[rows.length - 1]!.id : null;
     return { users: items, nextCursor };
   }
 
@@ -794,6 +810,25 @@ export class ContactRepository {
         ),
       );
 
+    // Per-address topic opt-outs (a user who wants marketing at home but not at
+    // work). Without them the pipeline cannot honour an opt-out it accepted.
+    const topicsByContact = new Map<string, Record<string, boolean>>();
+    if (rows.length > 0) {
+      const topicRows = await this.db
+        .select()
+        .from(contactTopicPreferences)
+        .where(
+          inArray(
+            contactTopicPreferences.contactId,
+            rows.map((r) => r.id),
+          ),
+        );
+      for (const t of topicRows) {
+        if (!topicsByContact.has(t.contactId)) topicsByContact.set(t.contactId, {});
+        topicsByContact.get(t.contactId)![t.topic] = t.enabled;
+      }
+    }
+
     const fetchedByUser = new Map<string, UserContact[]>();
     for (const id of missingIds) {
       fetchedByUser.set(id, []);
@@ -801,12 +836,13 @@ export class ContactRepository {
 
     for (const row of rows) {
       const contacts = fetchedByUser.get(row.userId) ?? [];
+      const topics = topicsByContact.get(row.id);
       contacts.push({
         id: row.id,
         userId: row.userId,
         channel: row.channel as ContactChannel,
         target: row.target,
-        preferences: {},
+        preferences: topics ? { topics } : {},
         active: row.enabled,
       });
       fetchedByUser.set(row.userId, contacts);
@@ -897,7 +933,29 @@ export class ContactRepository {
 
     const idMap = new Map(internalUserIdRows.map((r) => [r.externalId, r.id]));
 
-    const validContacts = contactsList.filter((c) => idMap.has(c.userId));
+    // The same address can arrive twice — as `email` and again in `contacts`
+    // — and ON CONFLICT DO UPDATE rejects a statement that touches one row
+    // twice. Keep one entry per address, merging their topic preferences.
+    const byAddress = new Map<string, (typeof contactsList)[number]>();
+    for (const c of contactsList) {
+      if (!idMap.has(c.userId)) continue;
+      const key = `${c.userId}\u0000${c.channel}\u0000${c.target}`;
+      const seen = byAddress.get(key);
+      byAddress.set(
+        key,
+        seen
+          ? {
+              ...c,
+              preferences: {
+                ...seen.preferences,
+                ...c.preferences,
+                topics: { ...seen.preferences?.topics, ...c.preferences?.topics },
+              },
+            }
+          : c,
+      );
+    }
+    const validContacts = [...byAddress.values()];
     if (validContacts.length === 0) return;
 
     const inserted = await this.db
@@ -1118,6 +1176,7 @@ export class ProjectRepository {
       await tx.delete(suppressions).where(eq(suppressions.projectId, id));
       await tx.delete(messageLogs).where(eq(messageLogs.projectId, id));
       await tx.delete(workflowInstances).where(eq(workflowInstances.projectId, id));
+      await tx.delete(workflowDefinitions).where(eq(workflowDefinitions.projectId, id));
 
       const result = await tx.delete(projects).where(eq(projects.id, id)).returning();
       return result.length > 0;
@@ -1234,7 +1293,7 @@ export class WorkflowRepository {
     return await this.db.transaction(async (tx) => {
       const result = await tx
         .update(workflowInstances)
-        .set({ status: "canceled" as any })
+        .set({ status: "canceled" })
         .where(
           and(
             eq(workflowInstances.id, instanceId),
