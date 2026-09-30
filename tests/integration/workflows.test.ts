@@ -51,6 +51,37 @@ workflow("await-go", async ({ step }) => {
   const r = await step.waitForEvent("go", { timeout: "1h" });
   await step.run("after", () => ({ got: r }));
 });
+workflow("quick-nap", async ({ step }) => {
+  await step.wait("500ms");
+  await step.run("woke", () => true);
+});
+workflow("fractional-wait", async ({ step }) => {
+  await step.wait("1.5h");
+});
+workflow("fractional-nap", async ({ step }) => {
+  await step.wait("0.5s");
+  await step.run("woke", () => true);
+});
+workflow("vague-wait", async ({ step }) => {
+  await step.wait("soon");
+});
+workflow("pays-twice", async ({ step }) => {
+  await step.waitForEvent("order.paid", { timeout: "3s" });
+  const second = await step.waitForEvent("order.paid", { timeout: "1h" });
+  await step.run("after", () => ({ second }));
+});
+
+// Holds the handler mid-run until the test lets it go.
+const gates = new Map<string, () => void>();
+const gateReached = new Set<string>();
+workflow("gated", async ({ step, event }) => {
+  await step.run("hold", async () => {
+    gateReached.add(event.tag);
+    await new Promise<void>((resolve) => gates.set(event.tag, resolve));
+    return true;
+  });
+  await step.notify({ template: "hello" });
+});
 
 beforeAll(async () => {
   app = await startNotifkit(infra, {
@@ -276,6 +307,106 @@ describe("code-defined workflows", () => {
     expect((await instance(p.api, id)).status).toBe("canceled");
     expect(email.for(p.id)).toEqual([]);
   }, 20_000);
+
+  it("stays canceled when canceled mid-run, and runs no further steps", async () => {
+    const p = await project();
+    const tag = randomUUID();
+    const id = await trigger(p.api, { name: "gated", user: "alice", input: { tag } });
+    await waitFor("handler mid-run", () => gateReached.has(tag));
+
+    expect((await p.api("DELETE", `/v1/workflows/instances/${id}`)).status).toBe(204);
+    gates.get(tag)!();
+
+    await settle(3_000);
+    expect((await instance(p.api, id)).status).toBe("canceled");
+    expect(email.for(p.id)).toEqual([]);
+  }, 20_000);
+
+  it("does not let an answered wait's timeout fire on a later wait for the same event", async () => {
+    const p = await project();
+    const id = await trigger(p.api, { name: "pays-twice", user: "alice" });
+    await waitForStatus(p.api, id, "pending");
+
+    // Answer the first wait; the workflow moves on to the second.
+    await sendEvent(p.api, "order.paid", { n: 1 });
+    await waitFor(
+      "suspended on the second wait",
+      async () => (await instance(p.api, id))?.steps.length === 2,
+    );
+    await waitForStatus(p.api, id, "pending");
+
+    // Past the first wait's 3s deadline plus a timer poll.
+    await settle(9_000);
+    const inst = await instance(p.api, id);
+    expect(inst.status).toBe("pending");
+    expect(inst.steps[1].output).toBeNull();
+    expect(inst.waiters).toHaveLength(1);
+  }, 40_000);
+
+  it("keeps a long sleep's wake-up when a resume is deferred for a busy instance", async () => {
+    const p = await project();
+    const id = await trigger(p.api, { name: "waits-an-hour", user: "alice" });
+    await waitForStatus(p.api, id, "pending");
+
+    // A duplicate resume finds the instance locked by another process.
+    await infra.redis.set(`lock:workflow:${id}`, "other-process", "EX", 60);
+    await infra.redis.xadd(
+      STREAMS.WORKFLOW_INBOUND,
+      "*",
+      "data",
+      JSON.stringify({
+        ...buildStreamEvent(
+          "workflow.resumed",
+          {
+            projectId: p.id,
+            instanceId: id,
+            name: "waits-an-hour",
+            input: { user: { id: "alice" } },
+          },
+          "test",
+        ),
+        id: randomUUID(),
+        timestamp: new Date().toISOString(),
+      }),
+    );
+    await settle(1_500);
+    await infra.redis.del(`lock:workflow:${id}`);
+
+    const timers = await infra.redis.zrange("notif:workflow:timers", "0", "-1", "WITHSCORES");
+    const scores: number[] = [];
+    for (let i = 0; i < timers.length; i += 2) {
+      if (timers[i]!.includes(id)) scores.push(Number(timers[i + 1]));
+    }
+    expect(Math.max(...scores)).toBeGreaterThan(Date.now() + 30 * 60_000);
+  }, 20_000);
+
+  it("reads a millisecond wait as milliseconds", async () => {
+    const p = await project();
+    const id = await trigger(p.api, { name: "quick-nap", user: "alice" });
+    // One timer poll (5s) is enough; "500ms" once meant 500 seconds.
+    await waitForStatus(p.api, id, "completed", 12_000);
+  }, 20_000);
+
+  it("reads a fractional duration exactly: 1.5h sleeps 90 minutes, not 1 hour", async () => {
+    const p = await project();
+    const id = await trigger(p.api, { name: "fractional-wait", user: "alice" });
+    await waitForStatus(p.api, id, "pending");
+    const wait = (await instance(p.api, id)).steps.find((s: any) => s.action === "wait");
+    const sleptMs = wait.output.scheduledAt - Date.parse(wait.createdAt);
+    expect(Math.abs(sleptMs - 90 * 60_000)).toBeLessThan(60_000);
+  });
+
+  it("wakes from a fractional wait in a small unit", async () => {
+    const p = await project();
+    const id = await trigger(p.api, { name: "fractional-nap", user: "alice" });
+    await waitForStatus(p.api, id, "completed", 12_000);
+  }, 20_000);
+
+  it("fails a wait whose duration is not a duration at all", async () => {
+    const p = await project();
+    const id = await trigger(p.api, { name: "vague-wait", user: "alice" });
+    await waitForStatus(p.api, id, "failed");
+  });
 
   it("does nothing for a workflow nobody defined", async () => {
     const p = await project();

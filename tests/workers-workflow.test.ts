@@ -367,7 +367,8 @@ describe("WorkflowWorker Edge Cases", () => {
           input: { user: { id: "u-1" } },
         },
       ])
-      .mockResolvedValueOnce([]);
+      // Then the per-step cancellation checks, which find nothing canceled.
+      .mockResolvedValue([]);
 
     await worker.process(msg);
 

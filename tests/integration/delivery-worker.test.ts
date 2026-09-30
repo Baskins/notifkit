@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { randomUUID } from "node:crypto";
-import { DeliveryWorker } from "@/services/delivery/main.js";
+import { DeliveryWorker, MAX_THROTTLE_DEFERRALS } from "@/services/delivery/main.js";
 import { StreamConsumer, PendingMessageScanner, StreamProducer } from "@/queue/index.js";
 import { IdempotencyGuard } from "@/idempotency/index.js";
 import { ContactRepository, TemplateRepository, UserRepository } from "@/repositories/index.js";
@@ -302,7 +302,7 @@ describe("DeliveryWorker", () => {
     expect(sends).toBe(1);
   });
 
-  it("defers sends over the provider's limit, and fails them once the retries run out", async () => {
+  it("defers sends over the provider's limit, and fails them once the deferrals run out", async () => {
     const limited = new FakeProvider("sms", () => ({ success: true, providerMessageId: "x" }), {
       limit: 1,
       windowSeconds: 60,
@@ -311,14 +311,26 @@ describe("DeliveryWorker", () => {
     await w.start();
     const first = dispatched({ channel: "sms", destination: "+1" });
     const second = dispatched({ channel: "sms", destination: "+2" });
-    const exhausted = dispatched({ channel: "sms", destination: "+3", throttleAttemptCount: 3 });
-    for (const ev of [first, second, exhausted]) await publish(ev);
+    // Waiting for capacity is not a failed attempt: a backlog several windows
+    // deep must keep waiting, not fail once it has waited maxAttempts times.
+    const waitedLong = dispatched({
+      channel: "sms",
+      destination: "+3",
+      throttleAttemptCount: 3,
+      deliveryOptions: { maxAttempts: 3, timeoutMs: 10_000 },
+    });
+    const exhausted = dispatched({
+      channel: "sms",
+      destination: "+4",
+      throttleAttemptCount: MAX_THROTTLE_DEFERRALS,
+    });
+    for (const ev of [first, second, waitedLong, exhausted]) await publish(ev);
 
     await waitFor("one sent", () => limited.calls === 1);
-    await waitFor("deferred", async () => (await infra.redis.xlen(STREAMS.SCHEDULED)) === 1);
-    const [row] = await infra.sql`SELECT payload FROM scheduled_payloads`;
-    expect(row!.payload.throttleAttemptCount).toBe(1);
-    expect(Date.parse(row!.payload.scheduledAt)).toBeGreaterThan(Date.now());
+    await waitFor("deferred", async () => (await infra.redis.xlen(STREAMS.SCHEDULED)) === 2);
+    const rows = await infra.sql`SELECT payload FROM scheduled_payloads`;
+    expect(rows.map((r) => r.payload.throttleAttemptCount).sort()).toEqual([1, 4]);
+    for (const r of rows) expect(Date.parse(r.payload.scheduledAt)).toBeGreaterThan(Date.now());
 
     await waitFor("exhausted one failed", async () =>
       (await events()).some(

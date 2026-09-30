@@ -273,44 +273,26 @@ export class NotifkitServer extends EventEmitter {
       ? ["api", "delivery", "engine", "enricher", "scheduler", "ai", "workflow", "events"]
       : this.options.services;
 
-    if (services.includes("api")) {
-      const { stopApiServer } = await import("./services/api/main.js");
-      await stopApiServer();
-    }
-
-    if (services.includes("delivery")) {
-      const { stopDeliveryWorker } = await import("./services/delivery/main.js");
-      await stopDeliveryWorker();
-    }
-
-    if (services.includes("engine")) {
-      const { stopEngineWorker } = await import("./services/engine/main.js");
-      await stopEngineWorker();
-    }
-
-    if (services.includes("enricher")) {
-      const { stopEnricherWorker } = await import("./services/enricher/main.js");
-      await stopEnricherWorker();
-    }
-
-    if (services.includes("scheduler")) {
-      const { stopSchedulerWorker } = await import("./services/scheduler/main.js");
-      await stopSchedulerWorker();
-    }
-
-    if (services.includes("ai")) {
-      const { stopAiWorker } = await import("./services/ai/main.js");
-      await stopAiWorker();
-    }
-
-    if (services.includes("workflow")) {
-      const { stopWorkflowWorker } = await import("./services/workflow/main.js");
-      await stopWorkflowWorker();
-    }
-
-    if (services.includes("events")) {
-      const { stopEventWorker } = await import("./services/events/main.js");
-      await stopEventWorker();
+    // Upstream first. With the pipeline fused, the enricher's task runs the
+    // engine and delivery inline, so delivery's connections must outlive it;
+    // stopping delivery first failed those sends mid-flight, after the
+    // provider may already have accepted them. Events goes last because it
+    // records what delivery did.
+    const shutdownOrder: [string, () => Promise<void>][] = [
+      ["api", async () => (await import("./services/api/main.js")).stopApiServer()],
+      ["workflow", async () => (await import("./services/workflow/main.js")).stopWorkflowWorker()],
+      ["enricher", async () => (await import("./services/enricher/main.js")).stopEnricherWorker()],
+      ["ai", async () => (await import("./services/ai/main.js")).stopAiWorker()],
+      ["engine", async () => (await import("./services/engine/main.js")).stopEngineWorker()],
+      [
+        "scheduler",
+        async () => (await import("./services/scheduler/main.js")).stopSchedulerWorker(),
+      ],
+      ["delivery", async () => (await import("./services/delivery/main.js")).stopDeliveryWorker()],
+      ["events", async () => (await import("./services/events/main.js")).stopEventWorker()],
+    ];
+    for (const [name, stop] of shutdownOrder) {
+      if (services.includes(name)) await stop();
     }
 
     if (this.pgContainer) {

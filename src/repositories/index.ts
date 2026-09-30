@@ -24,6 +24,13 @@ import {
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
+/**
+ * Applied when a profile is read, not when it is written: an upsert that
+ * leaves a field out must keep the stored value rather than reset it.
+ */
+const DEFAULT_LANGUAGE = "en";
+const DEFAULT_TIMEZONE = "UTC";
+
 // ─── Domain types ───────────────────────────────────────────────────────────
 
 export interface UserProfile {
@@ -90,8 +97,8 @@ export class UserRepository {
     const attrs = rows[0].attributes as any;
     return {
       userId: rows[0].externalId,
-      language: attrs.language,
-      timezone: attrs.timezone,
+      language: attrs.language ?? DEFAULT_LANGUAGE,
+      timezone: attrs.timezone ?? DEFAULT_TIMEZONE,
       email: attrs.email,
     };
   }
@@ -180,8 +187,8 @@ export class UserRepository {
 
       const record: UserRecord = {
         userId: userRow.externalId,
-        language: attrs.language,
-        timezone: attrs.timezone,
+        language: attrs.language ?? DEFAULT_LANGUAGE,
+        timezone: attrs.timezone ?? DEFAULT_TIMEZONE,
         email: attrs.email,
         segments: segmentsByUserId.get(internalId) || [],
         preferences: {
@@ -338,7 +345,9 @@ export class UserRepository {
             .onConflictDoUpdate({
               target: [users.projectId, users.externalId],
               set: {
-                attributes: drizzleSql`excluded.attributes`,
+                // Merged, not replaced: a field the caller left out (absent
+                // from the JSON) keeps its stored value.
+                attributes: drizzleSql`${users.attributes} || excluded.attributes`,
                 updatedAt: new Date(),
               },
             });
@@ -621,7 +630,8 @@ export class UserRepository {
     }
 
     if (filters?.search) {
-      const term = `%${filters.search.trim()}%`;
+      // `%`, `_` and `\` in the search are literal, not wildcards.
+      const term = `%${filters.search.trim().replace(/[\\%_]/g, "\\$&")}%`;
       conditions.push(
         drizzleSql`(${users.externalId} ILIKE ${term} OR (${users.attributes}->>'email') ILIKE ${term})`,
       );
@@ -650,8 +660,8 @@ export class UserRepository {
       const attrs = r.attributes as any;
       return {
         userId: r.externalId,
-        language: attrs.language,
-        timezone: attrs.timezone,
+        language: attrs.language ?? DEFAULT_LANGUAGE,
+        timezone: attrs.timezone ?? DEFAULT_TIMEZONE,
         email: attrs.email,
         createdAt: r.createdAt.getTime(),
       };

@@ -396,7 +396,7 @@ export async function startApiServer() {
     res.setHeader("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS");
     res.setHeader(
       "Access-Control-Allow-Headers",
-      "Content-Type, Authorization, x-api-key, x-project-id",
+      "Content-Type, Authorization, x-api-key, x-project-id, x-idempotency-key",
     );
 
     if (req.method === "OPTIONS") {

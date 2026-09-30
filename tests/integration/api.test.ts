@@ -1082,3 +1082,105 @@ describe("admin dashboard", () => {
     }
   });
 });
+
+// ─── Regressions ────────────────────────────────────────────────────────────
+
+describe("regressions", () => {
+  it("keeps a user's stored profile when notify carries only part of it inline", async () => {
+    const p = await project();
+    await p.client.syncTemplates([{ id: "t", channel: "email", content: { subject: "s" } }]);
+    await p.client.addUser({ id: "u", email: "u@x.com", timezone: "Europe/Paris", language: "fr" });
+
+    const res = await p.api("POST", "/v1/notify", {
+      user: { id: "u", phone: ["+15550009"] },
+      template: "t",
+    });
+    expect(res.status).toBe(202);
+
+    const u = await p.client.getUser("u");
+    expect(u).toMatchObject({ timezone: "Europe/Paris", language: "fr", email: "u@x.com" });
+    expect(u.contacts!.map((c) => c.target).sort()).toEqual(["+15550009", "u@x.com"]);
+  });
+
+  it("still gives a brand-new inline user the default language and timezone", async () => {
+    const p = await project();
+    await p.client.syncTemplates([{ id: "t", channel: "email", content: { subject: "s" } }]);
+    await p.api("POST", "/v1/notify", { user: { id: "fresh", email: ["f@x.com"] }, template: "t" });
+    expect(await p.client.getUser("fresh")).toMatchObject({ language: "en", timezone: "UTC" });
+  });
+
+  it("honours a legacy millisecond cursor on the delivery log", async () => {
+    const p = await project();
+    await p.client.syncTemplates([{ id: "t", channel: "email", content: { subject: "s" } }]);
+    await p.client.addUser({ id: "u", email: "u@x.com" });
+    await p.client.notify({ user: "u", template: "t" });
+    await waitFor(
+      "logged",
+      async () => (await p.client.getNotificationLogs({ status: "delivered" })).logs.length === 1,
+    );
+    // A cursor from 1970 is older than every row, so the page is empty.
+    const res = await p.api("GET", "/v1/notifications/logs?cursor=1");
+    expect(res.body.logs).toEqual([]);
+  });
+
+  it("lets a browser send the idempotency key the API reads", async () => {
+    const res = await fetch(`${app.baseUrl}/v1/notify`, { method: "OPTIONS" });
+    expect(res.headers.get("access-control-allow-headers")?.toLowerCase()).toContain(
+      "x-idempotency-key",
+    );
+  });
+
+  it("answers a key deletion with an empty 204", async () => {
+    const p = await project();
+    const key = await app.admin("POST", `/v1/projects/${p.id}/keys`, {});
+    const res = await fetch(`${app.baseUrl}/v1/projects/${p.id}/keys/${key.body.id}`, {
+      method: "DELETE",
+      headers: { authorization: `Bearer ${ADMIN_KEY}` },
+    });
+    expect(res.status).toBe(204);
+    expect(res.headers.get("content-length") ?? "0").toBe("0");
+  });
+
+  it("refuses an event whose timestamp cannot be read", async () => {
+    const p = await project();
+    const res = await p.api(
+      "POST",
+      "/v1/events",
+      { name: "e", properties: {} },
+      { "x-timestamp": "not-a-date", "x-expiry": "60" },
+    );
+    expect(res.status).toBe(400);
+  });
+
+  it("treats % and _ in a search as literal characters", async () => {
+    const p = await project();
+    await p.client.createSuppression({ channel: "email", target: "a_b@x.com" });
+    await p.client.createSuppression({ channel: "email", target: "axb@x.com" });
+    const found = (await p.client.listSuppressions({ target: "a_b" })).suppressions;
+    expect(found.map((s) => s.target)).toEqual(["a_b@x.com"]);
+    expect((await p.client.listSuppressions({ target: "%" })).suppressions).toEqual([]);
+  });
+
+  it("serves many live event streams without leaking listener warnings", async () => {
+    const p = await project();
+    const warnings: string[] = [];
+    const onWarning = (w: Error) => warnings.push(w.name);
+    process.on("warning", onWarning);
+    const controllers = Array.from({ length: 12 }, () => new AbortController());
+    try {
+      await Promise.all(
+        controllers.map((c) =>
+          fetch(`${app.baseUrl}/v1/events/stream`, {
+            headers: { authorization: `Bearer ${p.apiKey}` },
+            signal: c.signal,
+          }),
+        ),
+      );
+      await settle(200);
+      expect(warnings).not.toContain("MaxListenersExceededWarning");
+    } finally {
+      for (const c of controllers) c.abort();
+      process.off("warning", onWarning);
+    }
+  });
+});

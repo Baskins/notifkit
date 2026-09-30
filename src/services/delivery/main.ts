@@ -83,6 +83,14 @@ const DISPATCH_LOG_DELAY_MS = 1_000;
 const RETRY_BACKOFF_MS = [30_000, 120_000, 600_000];
 
 /**
+ * How many times a send may be put back for want of provider capacity before
+ * it is failed. Separate from `maxAttempts`, which counts sends the provider
+ * refused: waiting in line is not a failed attempt, and a campaign several
+ * windows deeper than the provider's limit has to be able to wait that long.
+ */
+export const MAX_THROTTLE_DEFERRALS = 50;
+
+/**
  * Names the provider at `transports[i]` for its rate limit and circuit breaker.
  * The rate limit's budget lives in Redis and is shared by every delivery
  * process, so the name must come out the same everywhere: the class name,
@@ -390,6 +398,7 @@ export class DeliveryWorker extends BaseWorker {
     // channel is out of capacity only once every provider for it is.
     let startAt = -1;
     let retryAfterMs = Infinity;
+    let windowMs = Infinity;
     for (let i = 0; i < transports.length; i++) {
       const gate = await this.providerGate(task.channel, transports, i);
       if (gate.allowed) {
@@ -397,12 +406,12 @@ export class DeliveryWorker extends BaseWorker {
         break;
       }
       retryAfterMs = Math.min(retryAfterMs, gate.retryAfterMs);
+      windowMs = Math.min(windowMs, (transports[i].limits?.windowSeconds ?? 0) * 1000);
     }
     if (startAt === -1) {
       task.throttleAttemptCount = (task.throttleAttemptCount ?? 0) + 1;
-      const maxAttempts = task.deliveryOptions?.maxAttempts ?? 3;
 
-      if (task.throttleAttemptCount > maxAttempts) {
+      if (task.throttleAttemptCount > MAX_THROTTLE_DEFERRALS) {
         this.logger.warn(
           { messageId: message.id, taskId: task.taskId, attempts: task.throttleAttemptCount },
           "provider rate limit max attempts exceeded",
@@ -441,9 +450,15 @@ export class DeliveryWorker extends BaseWorker {
         return;
       }
 
+      // Spread over more windows the longer a task has waited. Every task turned
+      // away in one window used to come back at the same boundary, where the
+      // limit again let one window's worth through and bounced the rest.
+      const spreadMs = Number.isFinite(windowMs)
+        ? Math.random() * windowMs * Math.min(task.throttleAttemptCount, 10)
+        : 0;
       await this.reschedule(
         { ...original, throttleAttemptCount: task.throttleAttemptCount },
-        new Date(Date.now() + retryAfterMs),
+        new Date(Date.now() + retryAfterMs + spreadMs),
         "throttle",
       );
       return;

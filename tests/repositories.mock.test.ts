@@ -31,10 +31,11 @@ describe("Repositories (Mocked Unit Tests)", () => {
       const repo = new UserRepository(mockDb as any);
       const user = await repo.findById("proj-1", "u1");
 
+      // Defaults are applied on read, since upserts leave omitted fields unset.
       expect(user).toEqual({
         userId: "u1",
-        language: undefined,
-        timezone: undefined,
+        language: "en",
+        timezone: "UTC",
         email: "a@b.c",
       });
     });

@@ -160,6 +160,7 @@ describe("Redis Pre-compiled Commands (defineCommand)", () => {
         .mockResolvedValue([{ id: "inst-1", status: "pending", name: "flow", input: {} }]);
       qb.update = vi.fn().mockReturnValue(qb);
       qb.set = vi.fn().mockReturnValue(qb);
+      qb.returning = vi.fn().mockReturnValue(qb);
       qb.then = function (resolve: any) {
         resolve([{ id: "inst-1", status: "pending", name: "flow", input: {} }]);
       };

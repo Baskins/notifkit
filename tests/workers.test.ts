@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { AiWorker, PermanentAiError } from "@/services/ai/main.js";
-import { DeliveryWorker } from "@/services/delivery/main.js";
+import { DeliveryWorker, MAX_THROTTLE_DEFERRALS } from "@/services/delivery/main.js";
 import { PreferenceRepository } from "@/repositories/index.js";
 import {
   BaseWorker,
@@ -1531,13 +1531,28 @@ describe("DeliveryWorker", () => {
       expect(parkedPayload().throttleAttemptCount).toBe(3);
     });
 
-    it("gives up once the throttled retries exceed maxAttempts", async () => {
+    it("keeps waiting past maxAttempts: a deferral is not a failed attempt", async () => {
+      mockTransportRegistry.getAll.mockReturnValue([limitedTransport(vi.fn())]);
+      mockRedis.leaseApiRateLimit = vi.fn().mockResolvedValue(0);
+
+      await worker.process(
+        dispatched({ throttleAttemptCount: 3, deliveryOptions: { maxAttempts: 3 } }) as any,
+      );
+
+      expect(mockScheduledProducer.publish).toHaveBeenCalledTimes(1);
+      expect(parkedPayload().throttleAttemptCount).toBe(4);
+    });
+
+    it("gives up once the deferrals run out", async () => {
       const send = vi.fn();
       mockTransportRegistry.getAll.mockReturnValue([limitedTransport(send)]);
       mockRedis.leaseApiRateLimit = vi.fn().mockResolvedValue(0);
 
       await worker.process(
-        dispatched({ throttleAttemptCount: 3, deliveryOptions: { maxAttempts: 3 } }) as any,
+        dispatched({
+          throttleAttemptCount: MAX_THROTTLE_DEFERRALS,
+          deliveryOptions: { maxAttempts: 3 },
+        }) as any,
       );
 
       expect(send).not.toHaveBeenCalled();
@@ -1557,7 +1572,7 @@ describe("DeliveryWorker", () => {
 
       await worker.process(
         dispatched({
-          throttleAttemptCount: 9,
+          throttleAttemptCount: MAX_THROTTLE_DEFERRALS,
           deliveryOptions: { maxAttempts: 3 },
           fallbackChain: ["sms"],
           recipient,

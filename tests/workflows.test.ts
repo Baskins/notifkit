@@ -149,7 +149,7 @@ describe("Workflow Engine Edge Cases", () => {
     mockDb.returning.mockResolvedValueOnce([
       { id: "inst-1", name: "test-wait", status: "pending", input: { user: { id: "user-1" } } },
     ]); // insert returning — the row stores the trigger input, so it carries the user
-    mockDb.then.mockImplementationOnce((res) => res()); // For the update to running
+    mockDb.then.mockImplementationOnce((res) => res([{ id: "claimed" }])); // update to running claims the instance
     mockDb.then.mockImplementationOnce((res) => res([])); // steps query
 
     await worker.process(msg);
@@ -190,7 +190,7 @@ describe("Workflow Engine Edge Cases", () => {
         { id: "inst-1", name: "test-wait", status: "pending", input: { user: { id: "user-1" } } },
       ]),
     );
-    mockDb.then.mockImplementationOnce((res) => res()); // For the update to running
+    mockDb.then.mockImplementationOnce((res) => res([{ id: "claimed" }])); // update to running claims the instance
 
     // Existing steps: notify and wait
     mockDb.then.mockImplementationOnce((res) =>
@@ -247,6 +247,7 @@ describe("Workflow Engine Edge Cases", () => {
         input: { user: { id: "user-1" } },
       },
     ]);
+    mockDb.then.mockImplementationOnce((res) => res([{ id: "claimed" }])); // update to running claims the instance
     mockDb.then.mockImplementationOnce((res) => res([])); // steps
 
     await worker.process(msg);
@@ -282,7 +283,7 @@ describe("Workflow Engine Edge Cases", () => {
         },
       ]),
     );
-    mockDb.then.mockImplementationOnce((res) => res()); // For the update to running
+    mockDb.then.mockImplementationOnce((res) => res([{ id: "claimed" }])); // update to running claims the instance
     // Steps now contain the event output injected by EventWorker
     mockDb.then.mockImplementationOnce((res) =>
       res([{ stepIndex: "0", action: "waitForEvent", output: { action: "clicked" } }]),
@@ -326,7 +327,7 @@ describe("Workflow Engine Edge Cases", () => {
         },
       ]),
     );
-    mockDb.then.mockImplementationOnce((res) => res()); // For the update to running
+    mockDb.then.mockImplementationOnce((res) => res([{ id: "claimed" }])); // update to running claims the instance
     // Steps contain NO output (null) because EventWorker didn't inject anything, the scheduler woke it up
     mockDb.then.mockImplementationOnce((res) =>
       res([{ stepIndex: "0", action: "waitForEvent", output: null }]),
@@ -366,7 +367,7 @@ describe("Workflow Engine Edge Cases", () => {
         },
       ]),
     );
-    mockDb.then.mockImplementationOnce((res) => res()); // For the update to running
+    mockDb.then.mockImplementationOnce((res) => res([{ id: "claimed" }])); // update to running claims the instance
     // Persisted step records timedOut: true
     mockDb.then.mockImplementationOnce((res) =>
       res([{ stepIndex: "0", action: "waitForEvent", output: { timedOut: true } }]),

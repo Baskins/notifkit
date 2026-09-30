@@ -464,22 +464,32 @@ describe("BaseWorker", () => {
       expect((await dlq()).map((d) => d.id)).toEqual([ev.id]);
       expect(await pending()).toBe(0);
       expect(w.seen.map((s) => s.attempt)).toEqual([1, 2]);
-      expect(failed).toHaveLength(1);
+      // The event's id, as every other emitter reports it — not the stream
+      // entry id, which means nothing to a listener.
+      expect(failed).toEqual([ev.id]);
     } finally {
       globalEmitter.off("notification:failed", onFailed);
     }
   });
 
-  it("dead-letters a NonRetryableError immediately", async () => {
-    const w = worker(async () => {
-      throw new NonRetryableError("bad input");
-    });
-    await w.start();
-    const ev = await publish(1);
-    await waitFor("dead-lettered", async () => (await dlq()).length === 1);
-    expect((await dlq())[0].id).toBe(ev.id);
-    expect(await pending()).toBe(0);
-    expect(w.seen).toHaveLength(1);
+  it("dead-letters a NonRetryableError immediately, reporting the event's id", async () => {
+    const failed: string[] = [];
+    const onFailed = (id: string) => failed.push(id);
+    globalEmitter.on("notification:failed", onFailed);
+    try {
+      const w = worker(async () => {
+        throw new NonRetryableError("bad input");
+      });
+      await w.start();
+      const ev = await publish(1);
+      await waitFor("dead-lettered", async () => (await dlq()).length === 1);
+      expect((await dlq())[0].id).toBe(ev.id);
+      expect(await pending()).toBe(0);
+      expect(w.seen).toHaveLength(1);
+      expect(failed).toEqual([ev.id]);
+    } finally {
+      globalEmitter.off("notification:failed", onFailed);
+    }
   });
 
   it("leaves a message pending, without counting an error, when the lock is held", async () => {
@@ -687,4 +697,132 @@ describe("startHealthReporter", () => {
       await redis.disconnect();
     }
   });
+});
+
+// ─── Service workers: graceful stop ─────────────────────────────────────────
+
+describe("service workers drain their in-flight messages on stop", () => {
+  const PROJECT = "00000000-0000-4000-8000-000000000001";
+
+  /** Resolves "stopped", or "hung" if stop() outlasts `ms`. */
+  const stopWithin = (w: BaseWorker, ms: number) =>
+    Promise.race([w.stop().then(() => "stopped" as const), settle(ms).then(() => "hung" as const)]);
+
+  function streamWorkerParts(stream: any, group: any) {
+    const consumer = new StreamConsumer({
+      redis: infra.redis,
+      stream,
+      group,
+      consumer: "drain",
+      dlqStream: STREAMS.DEAD_LETTER,
+      blockMs: 100,
+      batchSize: 10,
+      logger,
+    });
+    const pendingScanner = new PendingMessageScanner({
+      redis: infra.redis,
+      stream,
+      group,
+      consumer: "drain",
+      logger,
+    });
+    return { consumer, pendingScanner, logger, recoveryIntervalMs: 60_000 };
+  }
+
+  async function publishTo(stream: string, type: string, payload: Record<string, unknown>) {
+    const ev = {
+      ...buildStreamEvent(type as any, payload, "test"),
+      id: randomUUID(),
+      timestamp: new Date().toISOString(),
+    };
+    await infra.redis.xadd(stream, "*", "data", JSON.stringify(ev));
+    return ev;
+  }
+
+  it("enricher: finishes a message that was mid-lookup when stop was called", async () => {
+    const { EnricherWorker } = await import("@/services/enricher/main.js");
+    let lookupStarted = false;
+    const published: unknown[] = [];
+    const producer = {
+      publishBatch: async (events: unknown[]) => {
+        published.push(...events);
+        return { messageIds: events.map(() => "1-0"), eventIds: events.map(() => randomUUID()) };
+      },
+    };
+    const w = new EnricherWorker({
+      ...streamWorkerParts(STREAMS.INBOUND_NORMAL, CONSUMER_GROUPS.ENRICHER),
+      concurrency: 10,
+      producers: { critical: producer, normal: producer, low: producer },
+      idempotency: new IdempotencyGuard({ redis: infra.redis, keyPrefix: "t:enr" }),
+      userRepo: {
+        findRecordsByIds: async () => {
+          lookupStarted = true;
+          await settle(300);
+          return [{ userId: "u1", preferences: {} }];
+        },
+      },
+      prefRepo: {},
+      contactRepo: {
+        findActiveByUserIds: async () =>
+          new Map([["u1", [{ id: "c1", channel: "email", target: "u1@x.com" }]]]),
+      },
+      templateCache: { getCachedTemplate: async () => null } as any,
+    });
+    await w.start();
+    await publishTo(STREAMS.INBOUND_NORMAL, "notification.requested", {
+      projectId: PROJECT,
+      target: { type: "user", userId: "u1" },
+      templateId: "t",
+      priority: "normal",
+      data: {},
+      fallback: false,
+    });
+    await waitFor("lookup in flight", () => lookupStarted);
+
+    expect(await stopWithin(w, 5_000)).toBe("stopped");
+    expect(published).toHaveLength(1);
+  }, 20_000);
+
+  it("workflow: finishes a run that was mid-step when stop was called", async () => {
+    const { WorkflowWorker } = await import("@/services/workflow/main.js");
+    const { workflow } = await import("@/workflows/index.js");
+    let stepStarted = false;
+    workflow("drain-on-stop", async ({ step }) => {
+      await step.run("slow", async () => {
+        stepStarted = true;
+        await settle(300);
+        return true;
+      });
+      await step.notify({ template: "t" });
+    });
+    const published: unknown[] = [];
+    const producer = {
+      publishBatch: async (events: unknown[]) => {
+        published.push(...events);
+        return { messageIds: events.map(() => "1-0"), eventIds: events.map(() => randomUUID()) };
+      },
+    };
+    const w = new WorkflowWorker({
+      ...streamWorkerParts(STREAMS.WORKFLOW_INBOUND, CONSUMER_GROUPS.WORKFLOW),
+      concurrency: 10,
+      redis: infra.redis,
+      db: infra.db,
+      workflowProducer: producer,
+      notificationProducer: producer,
+    });
+    await w.start();
+    const instanceId = randomUUID();
+    await publishTo(STREAMS.WORKFLOW_INBOUND, "workflow.triggered", {
+      projectId: PROJECT,
+      instanceId,
+      name: "drain-on-stop",
+      input: { user: { id: "u1" } },
+    });
+    await waitFor("step in flight", () => stepStarted);
+
+    expect(await stopWithin(w, 5_000)).toBe("stopped");
+    expect(published).toHaveLength(1);
+    const [row] = await infra.sql`SELECT status FROM workflow_instances WHERE id = ${instanceId}`;
+    expect(row!.status).toBe("completed");
+  }, 20_000);
 });

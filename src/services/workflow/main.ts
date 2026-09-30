@@ -45,6 +45,39 @@ export const WORKFLOW_TIMERS_KEY = "notif:workflow:timers";
 const WORKFLOW_RESUME_RETRY_MS = 2_000;
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
+/** Seconds per unit. Everything is read as seconds first, then scheduled in ms. */
+const DURATION_UNIT_SECONDS: Record<string, number> = {
+  ms: 0.001,
+  s: 1,
+  m: 60,
+  h: 3_600,
+  d: 86_400,
+};
+
+/**
+ * `"500ms"`, `"0.5s"`, `"15m"`, `"1.5h"`, `"2.5d"` to seconds. Decimals are
+ * read exactly; anything that is not a number and a unit throws. The old
+ * parser matched on the last character, so "500ms" meant 500 seconds, and ran
+ * parseInt, so "1.5h" meant one hour.
+ */
+export function parseDurationSeconds(value: string, what: string): number {
+  const match = /^(\d+(?:\.\d+)?|\.\d+)(ms|s|m|h|d)$/.exec(value.trim());
+  if (!match) throw new Error(`Invalid ${what}: ${value}`);
+  return Number(match[1]) * DURATION_UNIT_SECONDS[match[2]!]!;
+}
+
+function durationToMs(value: string, what: string): number {
+  return Math.round(parseDurationSeconds(value, what) * 1000);
+}
+
+/** Thrown at a step boundary once the instance has been canceled. */
+class WorkflowCanceledError extends Error {
+  constructor() {
+    super("Workflow instance was canceled");
+    this.name = "WorkflowCanceledError";
+  }
+}
+
 loadEnv();
 const config = readBaseConfig();
 let logger: Logger;
@@ -94,12 +127,15 @@ export class WorkflowWorker extends BaseWorker {
   }
 
   override async stop(): Promise<void> {
+    // The flush interval keeps running until in-flight runs settle: a step's
+    // notify is waiting on it, and clearing it first left the drain to the 30s
+    // stop timeout with the instance lock still being renewed.
+    await super.stop();
     if (this.flushTimer) {
       clearInterval(this.flushTimer);
       this.flushTimer = null;
     }
     await this.flushWorkerBuffers();
-    await super.stop();
   }
 
   private async flushWorkerBuffers(): Promise<void> {
@@ -133,7 +169,10 @@ export class WorkflowWorker extends BaseWorker {
    * Re-delivers a resume through the timer ZSET a few seconds from now. The
    * poll loop publishes it once the instance is pending again, and drops it if
    * the instance has finished. The member carries no timestamp, so repeated
-   * deferrals of one instance collapse into a single entry.
+   * deferrals of one instance collapse into a single entry. It is marked
+   * `deferred` so it never equals a `wait` timer's member: sharing one let the
+   * ZADD here re-score a sleep's wake-up to seconds from now, and the early
+   * resume then re-suspended with no timer left to wake it.
    */
   private async deferResume(payload: any): Promise<void> {
     await this.redisCli.zadd(
@@ -144,6 +183,7 @@ export class WorkflowWorker extends BaseWorker {
         name: payload.name,
         projectId: payload.projectId,
         input: payload.input ?? {},
+        deferred: true,
       }),
     );
   }
@@ -271,10 +311,28 @@ export class WorkflowWorker extends BaseWorker {
         return;
       }
 
-      await this.dbConn
+      // Conditional, so a cancel that lands between the read above and here
+      // is not overwritten.
+      const claimed = await this.dbConn
         .update(workflowInstances)
         .set({ status: "running" })
-        .where(eq(workflowInstances.id, instanceId));
+        .where(and(eq(workflowInstances.id, instanceId), eq(workflowInstances.status, "pending")))
+        .returning({ id: workflowInstances.id });
+      if (claimed.length === 0) {
+        this.logger.info({ instanceId }, "Workflow is no longer pending, skipping");
+        return;
+      }
+
+      // A cancel can arrive while the handler runs. Checked before each new
+      // step, so a canceled instance stops at the next step boundary.
+      const stopIfCanceled = async () => {
+        const [row] = await this.dbConn
+          .select({ status: workflowInstances.status })
+          .from(workflowInstances)
+          .where(eq(workflowInstances.id, instanceId))
+          .limit(1);
+        if (row?.status === "canceled") throw new WorkflowCanceledError();
+      };
 
       // Load existing steps
       const existingSteps = await this.dbConn
@@ -292,6 +350,7 @@ export class WorkflowWorker extends BaseWorker {
         notify: async (args) => {
           const stepId = String(currentStepIndex++);
           if (stepOutputMap.has(stepId)) return stepOutputMap.get(stepId);
+          await stopIfCanceled();
 
           // The step payload is the same shape as notify(), but the wire event
           // is not — translate rather than spread.
@@ -348,14 +407,9 @@ export class WorkflowWorker extends BaseWorker {
             }
             return;
           }
+          await stopIfCanceled();
 
-          // Simple duration parse (e.g. '2h' -> ms)
-          let ms = 0;
-          if (duration.endsWith("d")) ms = parseInt(duration) * 24 * 60 * 60 * 1000;
-          else if (duration.endsWith("h")) ms = parseInt(duration) * 60 * 60 * 1000;
-          else if (duration.endsWith("m")) ms = parseInt(duration) * 60 * 1000;
-          else if (duration.endsWith("s")) ms = parseInt(duration) * 1000;
-          else throw new Error(`Invalid wait duration: ${duration}`);
+          const ms = durationToMs(duration, "wait duration");
 
           const resumeAt = Date.now() + ms;
 
@@ -397,17 +451,13 @@ export class WorkflowWorker extends BaseWorker {
             }
             return out;
           }
+          await stopIfCanceled();
 
           options = options || {};
           options.timeout = options.timeout || "24h";
           options.match = options.match || {};
 
-          let ms = 0;
-          if (options.timeout.endsWith("d")) ms = parseInt(options.timeout) * 24 * 60 * 60 * 1000;
-          else if (options.timeout.endsWith("h")) ms = parseInt(options.timeout) * 60 * 60 * 1000;
-          else if (options.timeout.endsWith("m")) ms = parseInt(options.timeout) * 60 * 1000;
-          else if (options.timeout.endsWith("s")) ms = parseInt(options.timeout) * 1000;
-          else throw new Error(`Invalid waitForEvent timeout: ${options.timeout}`);
+          const ms = durationToMs(options.timeout, "waitForEvent timeout");
 
           const resumeAt = Date.now() + ms;
 
@@ -448,6 +498,7 @@ export class WorkflowWorker extends BaseWorker {
         run: async (stepName, fn) => {
           const stepId = String(currentStepIndex++);
           if (stepOutputMap.has(stepId)) return stepOutputMap.get(stepId);
+          await stopIfCanceled();
 
           const result = await fn();
           await this.dbConn.insert(workflowSteps).values({
@@ -466,27 +517,29 @@ export class WorkflowWorker extends BaseWorker {
         event: (instance!.input as any) || { user: { id: "unknown" } },
       };
 
+      // Only from `running`: a cancel that landed mid-run must stand.
+      const finish = (status: "completed" | "pending" | "failed") =>
+        this.dbConn
+          .update(workflowInstances)
+          .set({ status })
+          .where(
+            and(eq(workflowInstances.id, instance!.id), eq(workflowInstances.status, "running")),
+          );
+
       try {
         await handler(ctx);
         // If we reach here, workflow completed
-        await this.dbConn
-          .update(workflowInstances)
-          .set({ status: "completed" })
-          .where(eq(workflowInstances.id, instance!.id));
+        await finish("completed");
         this.logger.info({ instanceId: instance!.id }, "Workflow completed successfully");
       } catch (err: any) {
-        if (err instanceof SuspendExecutionError || err.name === "SuspendExecutionError") {
-          await this.dbConn
-            .update(workflowInstances)
-            .set({ status: "pending" })
-            .where(eq(workflowInstances.id, instance!.id));
+        if (err instanceof WorkflowCanceledError) {
+          this.logger.info({ instanceId: instance!.id }, "Workflow canceled mid-run, stopping");
+        } else if (err instanceof SuspendExecutionError || err.name === "SuspendExecutionError") {
+          await finish("pending");
           this.logger.info({ instanceId: instance!.id, reason: err.reason }, "Workflow suspended");
         } else {
           this.logger.error({ err, instanceId: instance!.id }, "Workflow failed");
-          await this.dbConn
-            .update(workflowInstances)
-            .set({ status: "failed" })
-            .where(eq(workflowInstances.id, instance!.id));
+          await finish("failed");
         }
       }
     } finally {
@@ -578,7 +631,27 @@ export async function startWorkflowWorker() {
           if (inst.status === "running") continue;
 
           if (task.isEventTimeout) {
-            // It's a timeout for waitForEvent. Clean up only this step's waiter
+            // A timeout for one waitForEvent step. If that step already has an
+            // output the event came first and this timer is stale; acting on it
+            // would time out a later wait on the same event name.
+            if (task.stepId !== undefined) {
+              const [own] = await db
+                .select({ output: workflowSteps.output })
+                .from(workflowSteps)
+                .where(
+                  and(
+                    eq(workflowSteps.instanceId, task.instanceId),
+                    eq(workflowSteps.stepIndex, String(task.stepId)),
+                  ),
+                )
+                .limit(1);
+              if (!own || own.output !== null) {
+                await redis.native.zrem(WORKFLOW_TIMERS_KEY, taskStr);
+                continue;
+              }
+            }
+
+            // Clean up only this step's waiter
             const deleted = await db
               .delete(workflowWaiters)
               .where(
@@ -606,7 +679,10 @@ export async function startWorkflowWorker() {
                   eq(workflowSteps.action, "waitForEvent"),
                 ),
               );
-            const pendingStep = steps.find((s: any) => s.output === null);
+            const pendingStep =
+              task.stepId !== undefined
+                ? steps.find((s: any) => s.stepIndex === String(task.stepId) && s.output === null)
+                : steps.find((s: any) => s.output === null);
             if (pendingStep) {
               await db
                 .update(workflowSteps)

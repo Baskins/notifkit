@@ -149,6 +149,10 @@ export class EnricherWorker extends BaseWorker {
   }
 
   override async stop(): Promise<void> {
+    // The timers keep running until in-flight messages settle: each of them is
+    // waiting on one of these flushes, and clearing them first left the drain
+    // to the 30s stop timeout.
+    await super.stop();
     if (this.batchTimer) {
       clearTimeout(this.batchTimer);
       this.batchTimer = null;
@@ -164,7 +168,6 @@ export class EnricherWorker extends BaseWorker {
     await this.flushContactBatch();
     await this.flushUserBatch();
     await this.flushWorkerBuffers();
-    await super.stop();
   }
 
   private async flushWorkerBuffers(): Promise<void> {

@@ -138,13 +138,15 @@ function contactsOf(user: InlineUserLike): ResolvedContact[] {
 /** Persist user records + their contacts in bulk. Shared by addUser and inline notify. */
 async function persistUsers(deps: Deps, users: InlineUserLike[], projectId: string): Promise<void> {
   const usersList = users.map((u) => {
-    const primaryEmail =
-      u.email?.[0] ?? u.contacts?.find((c) => c.channel === "email")?.target ?? null;
+    const primaryEmail = u.email?.[0] ?? u.contacts?.find((c) => c.channel === "email")?.target;
 
+    // Omitted fields stay omitted: the upsert merges what is given into the
+    // stored profile, so an inline `{ id, phone }` on notify must not reset the
+    // user's timezone, language or email. Defaults are applied when read.
     return {
       userId: u.id,
-      language: u.language ?? "en",
-      timezone: u.timezone ?? "UTC",
+      language: u.language,
+      timezone: u.timezone,
       email: primaryEmail,
       segments: u.segments ?? [],
       preferences: u.preferences ?? {},
@@ -255,7 +257,7 @@ function encodeLogCursor(ts: string, id: string): string {
 function decodeLogCursor(cursor: string | null | undefined): { ts: string; id: string } | null {
   if (!cursor) return null;
   // Cursors handed out before this format were a millisecond timestamp.
-  if (/^d+$/.test(cursor)) {
+  if (/^\d+$/.test(cursor)) {
     return {
       ts: new Date(Number(cursor)).toISOString(),
       id: "ffffffff-ffff-ffff-ffff-ffffffffffff",
@@ -275,6 +277,14 @@ function decodeLogCursor(cursor: string | null | undefined): { ts: string; id: s
     // fall through
   }
   return null;
+}
+
+/**
+ * A LIKE pattern matching `term` anywhere, with the term's own `%`, `_` and
+ * `\` taken literally rather than as wildcards.
+ */
+function contains(term: string): string {
+  return `%${term.replace(/[\\%_]/g, "\\$&")}%`;
 }
 
 function getQueryParam(ctx: RouteContext, key: string): string | undefined {
@@ -663,6 +673,15 @@ export function createHandlers(deps: Deps) {
       const eventTime = new Date(tsStr as string).getTime();
       const expMs = parseInt(expiryStr as string, 10) * 1000;
 
+      // An unreadable timestamp or expiry made every comparison false, which
+      // let the event through unchecked.
+      if (Number.isNaN(eventTime) || Number.isNaN(expMs)) {
+        sendJson(res, 400, {
+          error: "invalid_timestamp",
+          message: "x-timestamp and x-expiry must be a date and a number of seconds",
+        });
+        return;
+      }
       if (now > eventTime + expMs) {
         sendJson(res, 400, { error: "event_expired", message: "Webhook event is expired" });
         return;
@@ -754,10 +773,10 @@ export function createHandlers(deps: Deps) {
     if (search) {
       conditions.push(
         or(
-          like(messageLogs.taskId, `%${search}%`),
-          like(messageLogs.templateId, `%${search}%`),
-          like(messageLogs.providerMessageId, `%${search}%`),
-          like(messageLogs.campaignId, `%${search}%`),
+          like(messageLogs.taskId, contains(search)),
+          like(messageLogs.templateId, contains(search)),
+          like(messageLogs.providerMessageId, contains(search)),
+          like(messageLogs.campaignId, contains(search)),
         )!,
       );
     }
@@ -1195,7 +1214,7 @@ export function createHandlers(deps: Deps) {
     if (!deleted) return sendJson(res, 404, { error: "key_not_found" });
 
     await deps.redis.native.publish("apikey.invalidated", "*");
-    sendJson(res, 204, {});
+    sendNoContent(res);
   }
 
   // ── GET /v1/system/health — getSystemHealth ──────────────────────────────
@@ -1785,7 +1804,7 @@ code{background:#f4f4f5;padding:.1rem .35rem;border-radius:4px}</style>
     ];
 
     if (search) {
-      conditions.push(like(messageLogs.campaignId, `%${search}%`));
+      conditions.push(like(messageLogs.campaignId, contains(search)));
     }
     if (channel) {
       conditions.push(eq(messageLogs.channel, channel as any));
@@ -1958,7 +1977,7 @@ code{background:#f4f4f5;padding:.1rem .35rem;border-radius:4px}</style>
     const conditions = [eq(suppressions.projectId, ctx.projectId!)];
     if (channel) conditions.push(eq(suppressions.channel, channel as any));
     if (reason) conditions.push(eq(suppressions.reason, reason));
-    if (target) conditions.push(like(suppressions.target, `%${target.toLowerCase().trim()}%`));
+    if (target) conditions.push(like(suppressions.target, contains(target.toLowerCase().trim())));
 
     const rows = await deps.db
       .select()

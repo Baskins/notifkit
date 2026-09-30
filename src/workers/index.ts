@@ -248,7 +248,7 @@ export abstract class BaseWorker {
         );
         globalEmitter.emit(
           "notification:failed",
-          message.id,
+          message.event.id,
           "Poison pill: max retries exceeded",
           message.event.type,
         );
@@ -294,7 +294,7 @@ export abstract class BaseWorker {
         await this.consumer.nack(message.id, message.event, stream, (err as Error).message);
         globalEmitter.emit(
           "notification:failed",
-          message.id,
+          message.event.id,
           (err as Error).message,
           message.event.type,
         );
