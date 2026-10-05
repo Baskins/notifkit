@@ -37,6 +37,15 @@ import {
 loadEnv();
 const config = readBaseConfig();
 
+/**
+ * A caller's own idempotency key (X-Idempotency-Key, or a workflow step's) is a
+ * documented 24-hour promise. Without one the key is the event's id, which only
+ * a redelivery can bring back, so the guard's shorter TTL is enough.
+ */
+const CALLER_KEY_TTL_SECONDS = 86_400;
+const dedupeTtl = (raw: { idempotencyKey?: string }) =>
+  raw.idempotencyKey ? CALLER_KEY_TTL_SECONDS : undefined;
+
 let logger: Logger;
 let redis: RedisClient;
 let sql: any;
@@ -324,7 +333,7 @@ export class EnricherWorker extends BaseWorker {
         await this.idempotency.unmark(dedupeId).catch(() => {});
         throw err;
       });
-      await this.idempotency.markProcessed(dedupeId);
+      await this.idempotency.markProcessed(dedupeId, dedupeTtl(raw));
       return;
     }
 
@@ -361,7 +370,7 @@ export class EnricherWorker extends BaseWorker {
         // the enriched stream is not a payload the engine can read, so the
         // refusal used to vanish there without a trace.
         globalEmitter.emit("notification:failed", event.id, reason, event.type);
-        await this.idempotency.markProcessed(dedupeId);
+        await this.idempotency.markProcessed(dedupeId, dedupeTtl(raw));
         return;
       }
 
@@ -553,7 +562,7 @@ export class EnricherWorker extends BaseWorker {
       throw err;
     });
 
-    await this.idempotency.markProcessed(dedupeId);
+    await this.idempotency.markProcessed(dedupeId, dedupeTtl(raw));
   }
 }
 
@@ -582,7 +591,7 @@ export async function startEnricherWorker() {
   const idempotency = new IdempotencyGuard({
     redis: redis.native,
     keyPrefix: "notif:processed:enricher",
-    ttlSeconds: 86_400,
+    ttlSeconds: config.IDEMPOTENCY_TTL_SECONDS,
   });
 
   const userRepo = new UserRepository(db);

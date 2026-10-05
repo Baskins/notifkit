@@ -261,6 +261,92 @@ describe("StreamConsumer", () => {
     expect(await infra.redis.exists(DLQ)).toBe(0);
   });
 
+  // Each stream has exactly one consumer group, so once that group has acked an
+  // entry nothing will read it again. Left in place it holds Redis memory until
+  // MAXLEN trims it, which under load is the bulk of what Redis stores.
+  describe("deletes entries once they are acked", () => {
+    async function ids(stream: string) {
+      return (await infra.redis.xrange(stream, "-", "+")).map((e) => e[0]);
+    }
+
+    it("ack deletes the acked entry and leaves the unacked ones", async () => {
+      const c = consumer();
+      await c.ensureGroup();
+      for (let n = 0; n < 3; n++)
+        await infra.redis.xadd(A, "*", "data", JSON.stringify(envelope(n)));
+      const got = await readN(c, 3);
+
+      await c.ack(got[0].id, A);
+      expect(await ids(A)).toEqual([got[1].id, got[2].id]);
+
+      await c.ack([got[1].id, got[2].id], A);
+      expect(await infra.redis.xlen(A)).toBe(0);
+    });
+
+    it("buffered acks delete the entries they flush", async () => {
+      const c = consumer({ bufferAcks: true, ackFlushMs: 60_000, batchSize: 100 });
+      await c.ensureGroup();
+      for (let n = 0; n < 2; n++)
+        await infra.redis.xadd(A, "*", "data", JSON.stringify(envelope(n)));
+      const got = await readN(c, 2);
+
+      await c.ack(got[0].id, A);
+      expect(await infra.redis.xlen(A)).toBe(2); // still buffered
+      await c.ack(got[1].id, A);
+      await c.flushAcks();
+      expect(await infra.redis.xlen(A)).toBe(0);
+    });
+
+    it("unparseable entries are deleted as they are skipped", async () => {
+      const c = consumer();
+      await c.ensureGroup();
+      await infra.redis.xadd(A, "*", "data", "{not json");
+      const good = await infra.redis.xadd(A, "*", "data", JSON.stringify(envelope(9)));
+
+      await readN(c, 1);
+      expect(await ids(A)).toEqual([good]);
+    });
+
+    it("nack deletes the entry once it is in the dead-letter stream", async () => {
+      const c = consumer({ dlqStream: DLQ });
+      await c.ensureGroup();
+      await infra.redis.xadd(A, "*", "data", JSON.stringify(envelope()));
+      const [msg] = await readN(c, 1);
+
+      await c.nack(msg.id, msg.event, msg.stream);
+      expect(await infra.redis.xlen(A)).toBe(0);
+      expect(await infra.redis.xlen(DLQ)).toBe(1);
+    });
+
+    it("nack keeps the entry when the dead-letter write fails", async () => {
+      await infra.redis.set(DLQ, "wrong type");
+      const c = consumer({ dlqStream: DLQ });
+      await c.ensureGroup();
+      await infra.redis.xadd(A, "*", "data", JSON.stringify(envelope()));
+      const [msg] = await readN(c, 1);
+
+      await expect(c.nack(msg.id, msg.event, msg.stream)).rejects.toThrow();
+      expect(await ids(A)).toEqual([msg.id]);
+    });
+
+    it("an acked entry is not redelivered when the group is recreated", async () => {
+      const c = consumer();
+      await c.ensureGroup();
+      await infra.redis.xadd(A, "*", "data", JSON.stringify(envelope(1)));
+      const [msg] = await readN(c, 1);
+      await c.ack(msg.id, A);
+
+      // ensureGroup starts a missing group from "0", so anything still in the
+      // stream would be processed a second time.
+      await infra.redis.xgroup("DESTROY", A, GROUP);
+      const again = consumer();
+      await again.ensureGroup();
+      await infra.redis.xadd(A, "*", "data", JSON.stringify(envelope(2)));
+      const got = await readN(again, 2, 1_000);
+      expect(got.map((m) => m.event.payload.n)).toEqual([2]);
+    });
+  });
+
   it("deadLetter records an in-process event against the consumer's stream", async () => {
     const c = consumer({ dlqStream: DLQ });
     const ev = envelope(3);

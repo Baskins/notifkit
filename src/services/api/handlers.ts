@@ -529,7 +529,9 @@ export function createHandlers(deps: Deps) {
           aiPrompts: body.aiPrompts,
           fallback: body.fallback ?? false,
           scheduledAt: body.sendAt,
-          idempotencyKey: notificationId,
+          // Only a caller's own key: the enricher keeps those for the full
+          // 24-hour window, and dedupes everything else on the event id.
+          ...(req.headers["x-idempotency-key"] ? { idempotencyKey: notificationId } : {}),
           campaignId: body.campaign,
         };
 

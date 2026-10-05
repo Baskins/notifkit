@@ -1037,7 +1037,7 @@ export async function startDeliveryWorker() {
   const idempotency = new IdempotencyGuard({
     redis: redis.native,
     keyPrefix: "notif:processed:delivery",
-    ttlSeconds: 86_400,
+    ttlSeconds: config.IDEMPOTENCY_TTL_SECONDS,
   });
 
   // ─── Stage 3: Delivery Worker ───────────────────────────────────────────────

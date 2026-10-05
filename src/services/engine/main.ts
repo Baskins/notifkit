@@ -363,8 +363,8 @@ export class EngineWorker extends BaseWorker {
     if (enriched.scheduledAt) {
       const msUntil = new Date(enriched.scheduledAt).getTime() - Date.now();
       if (msUntil > 0) {
-        // base 24h (86400) + schedule time
-        customTtl = 86400 + Math.ceil(msUntil / 1000);
+        // Held until the send is due, then as long as any other marker.
+        customTtl = config.IDEMPOTENCY_TTL_SECONDS + Math.ceil(msUntil / 1000);
       }
     }
 
@@ -793,7 +793,7 @@ export async function startEngineWorker() {
   const idempotency = new IdempotencyGuard({
     redis: redis.native,
     keyPrefix: "notif:processed:engine",
-    ttlSeconds: 86_400,
+    ttlSeconds: config.IDEMPOTENCY_TTL_SECONDS,
   });
 
   const throttle = new UserThrottle({

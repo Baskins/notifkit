@@ -54,6 +54,7 @@ describe("StreamConsumer", () => {
   it("acks a message on a specific stream in multi-stream mode", async () => {
     const mockRedis = {
       xack: vi.fn().mockResolvedValue(1),
+      xdel: vi.fn().mockResolvedValue(1),
       duplicate: vi.fn().mockReturnThis(),
     };
 
@@ -72,6 +73,7 @@ describe("StreamConsumer", () => {
   it("defaults to the first stream if no stream is provided to ack", async () => {
     const mockRedis = {
       xack: vi.fn().mockResolvedValue(1),
+      xdel: vi.fn().mockResolvedValue(1),
       duplicate: vi.fn().mockReturnThis(),
     };
 
@@ -127,7 +129,11 @@ describe("StreamConsumer.ensureGroup", () => {
 
 describe("StreamConsumer.ack", () => {
   it("acks a batch of ids in one call", async () => {
-    const mockRedis = { xack: vi.fn().mockResolvedValue(2), duplicate: vi.fn().mockReturnThis() };
+    const mockRedis = {
+      xack: vi.fn().mockResolvedValue(2),
+      xdel: vi.fn().mockResolvedValue(1),
+      duplicate: vi.fn().mockReturnThis(),
+    };
     const consumer = new StreamConsumer({
       redis: mockRedis as any,
       stream: "stream-1" as any,
@@ -138,11 +144,16 @@ describe("StreamConsumer.ack", () => {
     await consumer.ack(["1-0", "2-0"]);
 
     expect(mockRedis.xack).toHaveBeenCalledWith("stream-1", "g", "1-0", "2-0");
+    expect(mockRedis.xdel).toHaveBeenCalledWith("stream-1", "1-0", "2-0");
   });
 
   it("does not call redis for an empty id list", async () => {
     // XACK with no ids is a syntax error, so the guard has to hold.
-    const mockRedis = { xack: vi.fn(), duplicate: vi.fn().mockReturnThis() };
+    const mockRedis = {
+      xack: vi.fn(),
+      xdel: vi.fn().mockResolvedValue(1),
+      duplicate: vi.fn().mockReturnThis(),
+    };
     const consumer = new StreamConsumer({
       redis: mockRedis as any,
       stream: "stream-1" as any,
@@ -156,7 +167,11 @@ describe("StreamConsumer.ack", () => {
   });
 
   it("buffers acks and flushes when batchSize is reached", async () => {
-    const mockRedis = { xack: vi.fn().mockResolvedValue(2), duplicate: vi.fn().mockReturnThis() };
+    const mockRedis = {
+      xack: vi.fn().mockResolvedValue(2),
+      xdel: vi.fn().mockResolvedValue(1),
+      duplicate: vi.fn().mockReturnThis(),
+    };
     const consumer = new StreamConsumer({
       redis: mockRedis as any,
       stream: "stream-1" as any,
@@ -174,7 +189,11 @@ describe("StreamConsumer.ack", () => {
   });
 
   it("flushes remaining buffered acks on flushAcks", async () => {
-    const mockRedis = { xack: vi.fn().mockResolvedValue(1), duplicate: vi.fn().mockReturnThis() };
+    const mockRedis = {
+      xack: vi.fn().mockResolvedValue(1),
+      xdel: vi.fn().mockResolvedValue(1),
+      duplicate: vi.fn().mockReturnThis(),
+    };
     const consumer = new StreamConsumer({
       redis: mockRedis as any,
       stream: "stream-1" as any,
@@ -198,6 +217,7 @@ describe("StreamConsumer.nack", () => {
     const mockRedis = {
       xadd: vi.fn().mockResolvedValue("9-0"),
       xack: vi.fn().mockResolvedValue(1),
+      xdel: vi.fn().mockResolvedValue(1),
       pipeline: vi.fn(),
       duplicate: vi.fn().mockReturnThis(),
       ...over,
@@ -258,6 +278,7 @@ describe("StreamConsumer.nack", () => {
   it("falls back to a plain ack when no DLQ stream is configured", async () => {
     const mockRedis = {
       xack: vi.fn().mockResolvedValue(1),
+      xdel: vi.fn().mockResolvedValue(1),
       xadd: vi.fn(),
       pipeline: vi.fn(),
       duplicate: vi.fn().mockReturnThis(),
@@ -288,6 +309,7 @@ describe("StreamConsumer.readBatch", () => {
     const mockRedis: any = {
       xreadgroup,
       xack: vi.fn().mockResolvedValue(1),
+      xdel: vi.fn().mockResolvedValue(1),
       duplicate: vi.fn(),
       quit: vi.fn().mockResolvedValue("OK"),
       disconnect: vi.fn(),
@@ -400,6 +422,7 @@ describe("StreamConsumer.readBatch", () => {
         return reply("stream-1", "1-0", JSON.stringify(validEvent()));
       }),
       xack: vi.fn(),
+      xdel: vi.fn().mockResolvedValue(1),
       duplicate: vi.fn(),
       quit: vi.fn().mockResolvedValue("OK"),
       disconnect: vi.fn(),
@@ -439,6 +462,7 @@ describe("StreamConsumer.readBatch", () => {
         return Promise.resolve(reply("stream-1", "1-0", JSON.stringify(validEvent())));
       }),
       xack: vi.fn(),
+      xdel: vi.fn().mockResolvedValue(1),
       duplicate: vi.fn(),
       quit: vi.fn().mockResolvedValue("OK"),
       disconnect: vi.fn(),

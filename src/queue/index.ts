@@ -299,8 +299,8 @@ export class StreamConsumer {
     for (const s of this.streams) {
       try {
         // Start from the beginning so events published before the first worker
-        // comes online are not silently skipped. Retention is controlled by the
-        // producer's MAXLEN policy rather than consumer-group creation time.
+        // comes online are not silently skipped. Entries are deleted as they are
+        // acked (see ackAndDelete), so what is left is only unprocessed work.
         await this.redis.xgroup("CREATE", s, this.group, "0", "MKSTREAM");
         this.logger?.info({ stream: s, group: this.group }, "consumer group created");
       } catch (err) {
@@ -378,7 +378,7 @@ export class StreamConsumer {
           for (const [id, fields] of messages) {
             const msg = parseMessage(id, fields, this.logger);
             if (!msg) {
-              await this.redis.xack(streamName, this.group, id);
+              await this.ackAndDelete(streamName, [id]);
               continue;
             }
             // Attach original stream name for dynamic acking
@@ -427,7 +427,7 @@ export class StreamConsumer {
     if (ids.length === 0) return;
 
     if (!this.bufferAcks) {
-      await this.redis.xack(s, this.group, ...ids);
+      await this.ackAndDelete(s, ids);
       this.logger?.debug({ stream: s, count: ids.length }, "messages acknowledged");
       return;
     }
@@ -449,12 +449,27 @@ export class StreamConsumer {
     }
   }
 
+  /**
+   * Acks and then deletes the entries. Every stream is read by exactly one
+   * consumer group, so an acked entry is never read again; leaving it in place
+   * holds Redis memory until MAXLEN trims it, and a group recreated from "0"
+   * (ensureGroup) would process it a second time. Both commands are issued
+   * before either is awaited, so auto-pipelining sends them in one round trip,
+   * and Redis runs them in order.
+   */
+  private async ackAndDelete(stream: string, ids: string[]): Promise<void> {
+    await Promise.all([
+      this.redis.xack(stream, this.group, ...ids),
+      this.redis.xdel(stream, ...ids),
+    ]);
+  }
+
   async flushAcksForStream(stream: string): Promise<void> {
     const ids = this.ackBuffers.get(stream);
     if (!ids || ids.length === 0) return;
     this.ackBuffers.set(stream, []);
     try {
-      await this.redis.xack(stream, this.group, ...ids);
+      await this.ackAndDelete(stream, ids);
       this.logger?.debug({ stream, count: ids.length }, "buffered messages acknowledged");
     } catch (err) {
       this.logger?.error({ err, stream, count: ids.length }, "failed to flush buffered acks");
@@ -523,7 +538,7 @@ export class StreamConsumer {
         throw new Error(`XADD to dead-letter stream ${this.dlqStream} returned null`);
       }
 
-      await this.redis.xack(s, this.group, messageId);
+      await this.ackAndDelete(s, [messageId]);
       this.logger?.warn(
         { stream: s, dlqStream: this.dlqStream, messageId, eventId: event.id, dlqId },
         "message moved to dead-letter queue and acked",

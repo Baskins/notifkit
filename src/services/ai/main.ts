@@ -336,7 +336,7 @@ export async function startAiWorker() {
   const idempotency = new IdempotencyGuard({
     redis: redis.native,
     keyPrefix: "notif:processed:ai",
-    ttlSeconds: 86_400,
+    ttlSeconds: config.IDEMPOTENCY_TTL_SECONDS,
   });
 
   // AI generation

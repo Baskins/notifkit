@@ -138,16 +138,25 @@ describe("AI-generated notifications", () => {
   it("sends once when an AI task is replayed after a crash lost its completion marker", async () => {
     const p = await project();
     await p.api("POST", "/v1/users", { id: "u", email: "u@x.com" });
-    await notify(p.api, { user: "u", template: "digest", aiPrompts: { summary: "once" } });
-    await waitFor("delivered", () => email.for(p.id).length === 1);
+    // Entries are deleted once acked, so capture the AI task as it is written.
+    const written: string[] = [];
+    const monitor = await infra.redis.monitor();
+    monitor.on("monitor", (_time: string, args: string[]) => {
+      if (args[0]?.toLowerCase() === "xadd" && args[1] === STREAMS.AI_PENDING)
+        written.push(args.at(-1)!);
+    });
+    try {
+      await notify(p.api, { user: "u", template: "digest", aiPrompts: { summary: "once" } });
+      await waitFor("delivered", () => email.for(p.id).length === 1);
+    } finally {
+      monitor.disconnect();
+    }
 
     // A crash between dispatching and recording completion: the marker never
     // landed, and the pending entry is replayed.
-    const [entry] = (await infra.redis.xrange(STREAMS.AI_PENDING, "-", "+")).filter(([, f]) =>
-      f[1]!.includes(p.id),
-    );
+    const entry = written.find((data) => data.includes(p.id));
     for (const key of await infra.redis.keys("notif:processed:ai:*")) await infra.redis.del(key);
-    await infra.redis.xadd(STREAMS.AI_PENDING, "*", "data", entry![1][1]!);
+    await infra.redis.xadd(STREAMS.AI_PENDING, "*", "data", entry!);
 
     await settle(3_000);
     expect(email.for(p.id)).toHaveLength(1);

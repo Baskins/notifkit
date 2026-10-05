@@ -277,6 +277,58 @@ export function definePipelineSuite(mode: { fused: boolean }) {
       expect(email.for(p.id)).toHaveLength(1);
     });
 
+    describe("idempotency marker lifetimes", () => {
+      // Markers are most of what Redis holds under load: a few per message.
+      // Only a caller's own key is a promise that outlives the pipeline (the
+      // documented 24-hour window); the rest just have to outlast redelivery.
+      const HOUR = 3_600;
+
+      /** Every marker written while `run` executes, with its remaining TTL. */
+      async function markersWrittenDuring(run: () => Promise<void>) {
+        const before = new Set(await infra.redis.keys("notif:processed:*"));
+        await run();
+        const added = (await infra.redis.keys("notif:processed:*")).filter((k) => !before.has(k));
+        return Promise.all(added.map(async (key) => ({ key, ttl: await infra.redis.ttl(key) })));
+      }
+
+      it("keeps a caller's idempotency key for 24 hours", async () => {
+        const p = await project();
+        await addUser(p.api, { id: "u", email: "u@x.com" });
+        const key = `order-${randomUUID()}`;
+        const markers = await markersWrittenDuring(async () => {
+          await notify(p.api, { user: "u", template: "receipt" }, { "x-idempotency-key": key });
+          await waitFor("delivered", () => email.for(p.id).length === 1);
+          await settle(300);
+        });
+
+        const clientMarker = markers.find(
+          (m) => m.key === `notif:processed:enricher:${p.id}:${key}`,
+        );
+        expect(clientMarker?.ttl).toBeGreaterThan(23 * HOUR);
+        for (const m of markers.filter((m) => m !== clientMarker)) {
+          expect(m, m.key).toMatchObject({ ttl: expect.any(Number) });
+          expect(m.ttl, m.key).toBeLessThanOrEqual(HOUR);
+        }
+      });
+
+      it("keeps every marker of a request without a key for at most an hour", async () => {
+        const p = await project();
+        await addUser(p.api, { id: "u", email: "u@x.com" });
+        const markers = await markersWrittenDuring(async () => {
+          await notify(p.api, { user: "u", template: "receipt" });
+          await waitFor("delivered", () => email.for(p.id).length === 1);
+          await settle(300);
+        });
+
+        // enricher and delivery always; the engine too when streamed.
+        expect(markers.length).toBeGreaterThanOrEqual(2);
+        for (const m of markers) {
+          expect(m.ttl, m.key).toBeGreaterThan(0);
+          expect(m.ttl, m.key).toBeLessThanOrEqual(HOUR);
+        }
+      });
+    });
+
     it("sends once when the same inbound event is read twice", async () => {
       const p = await project();
       await addUser(p.api, { id: "u", email: "u@x.com" });

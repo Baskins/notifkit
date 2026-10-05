@@ -59,6 +59,15 @@ export const baseConfigSchema = z.object({
     .optional()
     .transform((v) => v === "true" || v === "1"),
   QUEUE_MAX_LEN: z.coerce.number().int().min(1).default(100000),
+  /**
+   * How long the pipeline remembers it handled a message, so a redelivery
+   * after a crash is not sent twice. It only has to outlast redelivery (about
+   * ten minutes) plus however far behind the streams run; a caller's own
+   * X-Idempotency-Key is always kept for 24 hours regardless. These markers
+   * are most of Redis memory under load, so the cost of a longer window is
+   * real: a few hundred bytes per message for as long as it lasts.
+   */
+  IDEMPOTENCY_TTL_SECONDS: z.coerce.number().int().min(60).default(3600),
   DB_MAX_CONNECTIONS: z.coerce.number().int().min(1).default(2),
   LOG_FLUSH_INTERVAL_MS: z.coerce.number().int().min(50).default(500),
   LOG_BUFFER_MAX_SIZE: z.coerce.number().int().min(100).default(5000),
