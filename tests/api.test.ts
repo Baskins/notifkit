@@ -113,6 +113,30 @@ describe("getClientIp", () => {
   });
 });
 
+// z.coerce.boolean() is Boolean(value), so the string "false" coerced to true
+// and an operator who wrote TRUST_PROXY=false got a spoofable client IP.
+describe("TRUST_PROXY parsing", () => {
+  it.each([
+    ["false", false],
+    ["0", false],
+    ["", false],
+    ["true", true],
+    ["1", true],
+  ])("TRUST_PROXY=%j parses as %s", async (value, expected) => {
+    const { parseConfig, baseConfigSchema } = await import("@/config/index.js");
+
+    const config = parseConfig(baseConfigSchema, { TRUST_PROXY: value });
+
+    expect(config.TRUST_PROXY).toBe(expected);
+  });
+
+  it("defaults to false when unset", async () => {
+    const { parseConfig, baseConfigSchema } = await import("@/config/index.js");
+
+    expect(parseConfig(baseConfigSchema, {}).TRUST_PROXY).toBe(false);
+  });
+});
+
 describe("API Handlers", () => {
   let deps: Deps;
   let handlers: ReturnType<typeof createHandlers>;
