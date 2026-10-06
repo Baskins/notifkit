@@ -4,11 +4,12 @@ import {
   type Transport,
   type NotificationDispatchedPayload,
   type DeliveryResult,
+  type WebhookEvent,
 } from "notifkit";
 import http from "node:http";
 import os from "node:os";
 import { monitorEventLoopDelay } from "node:perf_hooks";
-import { STATS_KEYS, bucketFor } from "./stats.js";
+import { STATS_KEYS, WEBHOOK_PATH, WEBHOOK_SECRET, bucketFor } from "./stats.js";
 
 const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 3000;
 const NODE_NAME = process.env.NODE_NAME || os.hostname();
@@ -47,6 +48,9 @@ function parseLatency(val?: string): { min: number; max: number } {
 
 const latencyRange = parseLatency(process.env.PROVIDER_LATENCY_MS);
 const failureRate = Number(process.env.PROVIDER_FAILURE_RATE || 0);
+const openRate = Number(process.env.PROFILING_OPEN_RATE || 0);
+/** Bounds the opens list if nothing is consuming it. */
+const OPENS_MAX = 500_000;
 
 /**
  * Delivery counters, kept in memory and flushed to Redis four times a second.
@@ -59,6 +63,7 @@ class DeliveryStats {
   private buckets = new Map<number, number>();
   private first: number | null = null;
   private last: number | null = null;
+  private opens: string[] = [];
 
   constructor(private readonly redis: RedisClient["native"]) {
     setInterval(() => void this.flush(), 250).unref();
@@ -77,9 +82,15 @@ class DeliveryStats {
     this.failed++;
   }
 
+  /** Queues a delivered message for the runner to report as opened later. */
+  recordOpenable(providerMessageId: string): void {
+    this.opens.push(`${providerMessageId}|${Date.now()}`);
+  }
+
   private async flush(): Promise<void> {
     if (this.delivered === 0 && this.failed === 0) return;
-    const { delivered, failed, buckets, first, last } = this;
+    const { delivered, failed, buckets, first, last, opens } = this;
+    this.opens = [];
     this.delivered = 0;
     this.failed = 0;
     this.buckets = new Map();
@@ -94,6 +105,10 @@ class DeliveryStats {
     }
     if (first !== null) pipeline.hsetnx(STATS_KEYS.first, NODE_NAME, String(first));
     if (last !== null) pipeline.hset(STATS_KEYS.last, NODE_NAME, String(last));
+    if (opens.length) {
+      pipeline.rpush(STATS_KEYS.opens, ...opens);
+      pipeline.ltrim(STATS_KEYS.opens, -OPENS_MAX, -1);
+    }
     await pipeline.exec().catch(() => {});
   }
 }
@@ -101,6 +116,7 @@ class DeliveryStats {
 class ProfilingTransport implements Transport {
   readonly channel = "email";
   readonly limits = { limit: 1_000_000, windowSeconds: 1 };
+  readonly webhookPath = WEBHOOK_PATH;
 
   constructor(private readonly stats: DeliveryStats) {}
 
@@ -123,7 +139,30 @@ class ProfilingTransport implements Transport {
       ?.requestTime;
     this.stats.record(typeof requestTime === "number" ? Date.now() - requestTime : 0);
 
-    return { success: true, providerMessageId: `prof-${task.taskId}` };
+    const providerMessageId = `prof-${task.taskId}`;
+    if (openRate > 0 && Math.random() < openRate) this.stats.recordOpenable(providerMessageId);
+    return { success: true, providerMessageId };
+  }
+
+  async verifyWebhook(
+    _rawBody: string,
+    headers: Record<string, string | string[] | undefined>,
+  ): Promise<boolean> {
+    return headers["x-profiling-secret"] === WEBHOOK_SECRET;
+  }
+
+  /** A batch of engagement events, the way ESPs post them: `{ events: [{ id, status }] }`. */
+  async parseWebhook(body: any): Promise<WebhookEvent[]> {
+    const events: { id: string; status: WebhookEvent["status"]; url?: string }[] = Array.isArray(
+      body?.events,
+    )
+      ? body.events
+      : [];
+    return events.map((e) => ({
+      providerMessageId: e.id,
+      status: e.status,
+      ...(e.url ? { metadata: { url: e.url } } : {}),
+    }));
   }
 }
 
@@ -172,8 +211,17 @@ async function main(): Promise<void> {
   const stats = new DeliveryStats(redis.native);
   startNodeSampler(redis.native);
 
+  // The transport registry is process-wide. The API needs the transport to
+  // mount its webhook; registering it a second time for the workers would give
+  // delivery a "fallback" provider that hides every simulated failure.
+  const transport = new ProfilingTransport(stats);
+
   if (apiServices.length > 0) {
-    await new NotifkitServer({ ...baseOptions, services: apiServices }).start();
+    await new NotifkitServer({
+      ...baseOptions,
+      services: apiServices,
+      providers: [transport],
+    }).start();
   } else {
     // Worker-only node: a health endpoint for the compose healthcheck.
     http
@@ -196,7 +244,7 @@ async function main(): Promise<void> {
     await new NotifkitServer({
       ...baseOptions,
       services: workerServices,
-      providers: [new ProfilingTransport(stats)],
+      providers: apiServices.length > 0 ? undefined : [transport],
     }).start();
     console.log(`profiling node ${NODE_NAME} workers started [${workerServices.join(",")}]`);
   }

@@ -6,6 +6,7 @@ memory limits per container.
 ```bash
 npm run profile:vertical      # one monolith per tier, 1 → 5 vCPU
 npm run profile:horizontal    # API nodes + identical 1 vCPU pipeline workers
+npm run profile:sustained     # $25 box: highest rate that holds, then a 15 min soak
 ```
 
 Docker must be running. Each suite first builds notifkit's `dist/` and the node
@@ -61,6 +62,38 @@ The "busiest container" is the one closest to its CPU limit during steady state.
 --tiers=20,60,100
 --keep                  # leave containers up afterwards
 --skip-build / --skip-dist
+```
+
+## Sustained capacity
+
+`profile:sustained` answers "how many notifications/s does a $25 box really
+send": the $20 monolith with Redis at 512MB, everything running, with the noise
+production has.
+
+1. **ramp**: an unjudged warm-up, then open-model arrivals from `--start` (150/s)
+   in `--step` (+50/s) steps of `--step-sec` (60s), plus one step halfway past the last pass. A step
+   passes if the API takes what is offered and the backlog across every pipeline
+   stream does not trend upwards by more than 2% of the rate.
+2. **soak**: the highest passing rate (or `--soak-rate=N`) held for `--soak`
+   minutes (15). Backlog, parked retries, DLQ and Redis memory are sampled every 5s,
+   and Postgres sizes every 30s.
+
+While it runs:
+
+- The provider refuses `--failure-rate` (3%) of sends. They go through the real retry path (30s, then 2 min).
+- `--open-rate` (30%) of delivered messages are reported back as opened through the transport's webhook 20s later, in batches of 500. `--click-share` (15%) of those also click.
+- `--log-readers` (2) dashboard users read `GET /v1/notifications/logs` every 2s: the latest page, by template, failed, and by task.
+
+The report covers the ramp, the soak verdict, and API, end-to-end, webhook and log-read latency. It also shows Postgres growth: per notification, per table, and projected per hour, day and 30 days (there is no `message_logs` retention). Results go to `results/sustained-<timestamp>.json`.
+
+## Host ports
+
+The runner reaches Postgres, Redis and the API through host ports 35432, 36379
+and 35678. Windows sometimes reserves those at boot (`netsh interface ipv4 show
+excludedportrange protocol=tcp`). If so, override them:
+
+```bash
+PROF_DB_PORT=45432 PROF_REDIS_PORT=46379 PROF_API_PORT=45678 npm run profile:sustained
 ```
 
 ## Topologies

@@ -23,6 +23,9 @@ x-node-env: &node-env
   PUBLIC_URL: http://localhost:3000
   PROVIDER_LATENCY_MS: ${PROVIDER_LATENCY_MS:-150-250}
   PROVIDER_FAILURE_RATE: ${PROVIDER_FAILURE_RATE:-0}
+  # Share of delivered messages the runner later reports as opened through the
+  # profiling transport's webhook (tests/sustained.test.ts).
+  PROFILING_OPEN_RATE: ${PROFILING_OPEN_RATE:-0}
   # Worker services wait for the runner to open this gate, so ingest can be
   # measured on its own and the backlog it builds drained as a second phase.
   WORKER_GATE: "1"
@@ -88,7 +91,7 @@ services:
       - track_io_timing=on
     shm_size: 512mb
     ports:
-      - "35432:5432"
+      - "${PROF_DB_PORT:-35432}:5432"
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U notifkit -d notifkit"]
       interval: 1s
@@ -117,7 +120,7 @@ services:
         "noeviction",
       ]
     ports:
-      - "36379:6379"
+      - "${PROF_REDIS_PORT:-36379}:6379"
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 1s
@@ -136,7 +139,7 @@ services:
       <<: *node-env
       SERVICES: ${SERVER_SERVICES:-api,enricher,engine,delivery,scheduler,events}
     ports:
-      - "35678:3000"
+      - "${PROF_API_PORT:-35678}:3000"
     deploy:
       resources:
         limits:
@@ -150,7 +153,7 @@ services:
       <<: *node-env
       SERVICES: api
     ports:
-      - "35678:3000"
+      - "${PROF_API_PORT:-35678}:3000"
     deploy:
       resources:
         limits:

@@ -48,7 +48,13 @@ export const STATS_KEYS = {
   nodePattern: "prof:node:*",
   /** String: "open" once worker services may start. */
   gate: "prof:gate",
+  /** List of "providerMessageId|deliveredAtMs" the runner reports back as opened. */
+  opens: "prof:opens",
 } as const;
+
+/** Shared with the runner, which plays the provider posting engagement events. */
+export const WEBHOOK_SECRET = "profiling-webhook-secret";
+export const WEBHOOK_PATH = "/webhooks/profiling";
 
 export function bucketFor(latencyMs: number): number {
   for (const bound of LATENCY_BUCKETS_MS) {

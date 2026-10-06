@@ -7,18 +7,23 @@ import { STATS_KEYS, LATENCY_BUCKETS_MS, histogramPercentile } from "./stats.js"
 
 // ─── Paths & constants ──────────────────────────────────────────────────────
 
-const PROFILING_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+export const PROFILING_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const REPO_ROOT = path.resolve(PROFILING_DIR, "..");
 const COMPOSE_FILE = path.join(PROFILING_DIR, "docker-compose.yml");
-const RESULTS_DIR = path.join(PROFILING_DIR, "results");
+export const RESULTS_DIR = path.join(PROFILING_DIR, "results");
 const K6_OUT_DIR = path.join(RESULTS_DIR, ".k6");
 const IMAGE = "notifkit-prof-node:latest";
 const CONTAINER_PREFIX = "notifkit-prof-";
 
-const DB_URL = "postgres://notifkit:password@localhost:35432/notifkit";
-const REDIS_URL = "redis://localhost:36379";
-const API_URL = "http://localhost:35678";
-const ADMIN_API_KEY = "perf-admin-key";
+// Host ports, overridable because Windows (Hyper-V/WinNAT) reserves port
+// ranges at boot that can swallow the defaults; compose reads the same vars.
+const DB_PORT = process.env.PROF_DB_PORT || "35432";
+const REDIS_PORT = process.env.PROF_REDIS_PORT || "36379";
+const API_PORT = process.env.PROF_API_PORT || "35678";
+export const DB_URL = `postgres://notifkit:password@localhost:${DB_PORT}/notifkit`;
+export const REDIS_URL = `redis://localhost:${REDIS_PORT}`;
+export const API_URL = `http://localhost:${API_PORT}`;
+export const ADMIN_API_KEY = "perf-admin-key";
 
 const TEMPLATES = [
   { id: "order_confirmation", topic: [] as string[] },
@@ -73,6 +78,10 @@ export interface RunOptions {
   keep: boolean;
   /** Write a V8 CPU profile per node to results/cpuprof. */
   cpuProf: boolean;
+  /** Share of sends the simulated provider refuses, 0–1. */
+  providerFailureRate?: number;
+  /** Share of delivered messages reported back as opened through the webhook, 0–1. */
+  openRate?: number;
 }
 
 export interface Percentiles {
@@ -215,7 +224,7 @@ interface RunResult {
   stderr: string;
 }
 
-function run(
+export function run(
   cmd: string,
   args: string[],
   opts: { env?: Record<string, string>; cwd?: string; quiet?: boolean; allowFail?: boolean } = {},
@@ -249,13 +258,13 @@ function run(
   });
 }
 
-function compose(args: string[], env: Record<string, string>, quiet = true) {
+export function compose(args: string[], env: Record<string, string>, quiet = true) {
   return run("docker", ["compose", "-f", COMPOSE_FILE, ...args], { env, quiet });
 }
 
-const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+export const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
-function memoryMb(mem: string): number {
+export function memoryMb(mem: string): number {
   const m = /^([\d.]+)\s*([GMK]?)/i.exec(mem.trim());
   if (!m) return 1024;
   const n = parseFloat(m[1]!);
@@ -263,12 +272,12 @@ function memoryMb(mem: string): number {
   return unit === "G" ? n * 1024 : unit === "K" ? n / 1024 : n;
 }
 
-function round(n: number, digits = 1): number {
+export function round(n: number, digits = 1): number {
   const f = 10 ** digits;
   return Math.round(n * f) / f;
 }
 
-function median(values: number[]): number {
+export function median(values: number[]): number {
   if (values.length === 0) return 0;
   const s = [...values].sort((a, b) => a - b);
   const mid = Math.floor(s.length / 2);
@@ -315,7 +324,7 @@ interface CpuSample {
  * Samples `docker stats` for the whole run, tagging each sample with the phase
  * in progress, so each phase reports which container was working hardest.
  */
-class ResourceSampler {
+export class ResourceSampler {
   phase = "setup";
   private samples: CpuSample[] = [];
   private nodeSamples: { phase: string; node: string; data: Record<string, string> }[] = [];
@@ -419,11 +428,11 @@ class ResourceSampler {
 
 // ─── Stats readers ──────────────────────────────────────────────────────────
 
-async function resetStats(redis: RedisClient["native"]): Promise<void> {
+export async function resetStats(redis: RedisClient["native"]): Promise<void> {
   await redis.del(STATS_KEYS.counters, STATS_KEYS.latency, STATS_KEYS.first, STATS_KEYS.last);
 }
 
-async function readDelivery(redis: RedisClient["native"]) {
+export async function readDelivery(redis: RedisClient["native"]) {
   const [counters, first, last] = await Promise.all([
     redis.hgetall(STATS_KEYS.counters),
     redis.hvals(STATS_KEYS.first),
@@ -437,7 +446,7 @@ async function readDelivery(redis: RedisClient["native"]) {
   };
 }
 
-async function readLatency(redis: RedisClient["native"]): Promise<Percentiles> {
+export async function readLatency(redis: RedisClient["native"]): Promise<Percentiles> {
   const raw = await redis.hgetall(STATS_KEYS.latency);
   const counts = new Map<number, number>();
   for (const bound of LATENCY_BUCKETS_MS) {
@@ -484,7 +493,7 @@ interface K6Result {
   latency: Percentiles;
 }
 
-async function runK6(
+export async function runK6(
   env: Record<string, string>,
   k6Env: Record<string, string>,
 ): Promise<K6Result> {
@@ -519,7 +528,7 @@ async function runK6(
 
 // ─── Environment ────────────────────────────────────────────────────────────
 
-function composeEnv(tier: ProfileTier, opts: RunOptions): Record<string, string> {
+export function composeEnv(tier: ProfileTier, opts: RunOptions): Record<string, string> {
   const dbMb = memoryMb(tier.db.memory);
   const env: Record<string, string> = {
     DB_CPUS: tier.db.cpus,
@@ -533,6 +542,8 @@ function composeEnv(tier: ProfileTier, opts: RunOptions): Record<string, string>
     DELIVERY_CONCURRENCY: String(tier.deliveryConcurrency),
     DB_MAX_CONNECTIONS: String(tier.dbMaxConnections),
     PROVIDER_LATENCY_MS: opts.providerLatency,
+    PROVIDER_FAILURE_RATE: String(opts.providerFailureRate ?? 0),
+    PROFILING_OPEN_RATE: String(opts.openRate ?? 0),
     PIPELINE_FUSED: String(opts.fused),
     LOG_LEVEL: opts.logLevel,
     NODE_OPTIONS: opts.cpuProf ? "--cpu-prof --cpu-prof-dir=/prof" : "",
@@ -550,7 +561,7 @@ function composeEnv(tier: ProfileTier, opts: RunOptions): Record<string, string>
   return env;
 }
 
-function cpuLimits(tier: ProfileTier): Record<string, number> {
+export function cpuLimits(tier: ProfileTier): Record<string, number> {
   const limits: Record<string, number> = {
     db: parseFloat(tier.db.cpus),
     redis: parseFloat(tier.redis.cpus),
@@ -564,7 +575,7 @@ function cpuLimits(tier: ProfileTier): Record<string, number> {
 }
 
 /** Container id (the node's hostname) → compose service name. */
-async function nodeNames(): Promise<Map<string, string>> {
+export async function nodeNames(): Promise<Map<string, string>> {
   const res = await run("docker", ["ps", "--format", "{{.ID}}\t{{.Names}}"], {
     quiet: true,
     allowFail: true,
@@ -581,7 +592,7 @@ async function nodeNames(): Promise<Map<string, string>> {
 
 // ─── Setup ──────────────────────────────────────────────────────────────────
 
-async function provision(sql: any, users: number): Promise<string> {
+export async function provision(sql: any, users: number): Promise<string> {
   const projectRes = await fetch(`${API_URL}/v1/projects`, {
     method: "POST",
     headers: { Authorization: `Bearer ${ADMIN_API_KEY}`, "Content-Type": "application/json" },
@@ -894,7 +905,7 @@ export async function runTier(tier: ProfileTier, opts: RunOptions): Promise<Tier
   }
 }
 
-async function redisCommandStats(
+export async function redisCommandStats(
   redis: RedisClient["native"],
   delivered: number,
 ): Promise<RedisCommandStat[]> {
@@ -964,7 +975,7 @@ function capacityPlan(tier: ProfileTier, ingest: IngestResult, steady: SteadyRes
   };
 }
 
-async function pgReport(sql: any): Promise<PgReport> {
+export async function pgReport(sql: any): Promise<PgReport> {
   const statements = await sql`
     SELECT query, calls::bigint AS calls, total_exec_time AS total, mean_exec_time AS mean, rows::bigint AS rows
     FROM pg_stat_statements
@@ -1002,7 +1013,7 @@ async function pgReport(sql: any): Promise<PgReport> {
 
 // ─── Reporting ──────────────────────────────────────────────────────────────
 
-function table(headers: string[], rows: (string | number)[][]): string {
+export function table(headers: string[], rows: (string | number)[][]): string {
   const widths = headers.map((h, i) =>
     Math.max(h.length, ...rows.map((r) => String(r[i] ?? "").length)),
   );
@@ -1013,7 +1024,7 @@ function table(headers: string[], rows: (string | number)[][]): string {
   );
 }
 
-function resourceRows(res: PhaseResources): (string | number)[][] {
+export function resourceRows(res: PhaseResources): (string | number)[][] {
   return Object.entries(res.containers)
     .sort((a, b) => b[1].avgUtil - a[1].avgUtil)
     .map(([name, c]) => {

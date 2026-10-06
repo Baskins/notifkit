@@ -7,6 +7,7 @@
     "start": "node --import tsx src/server.ts",
     "profile:vertical": "tsx tests/vertical.test.ts",
     "profile:horizontal": "tsx tests/horizontal.test.ts",
+    "profile:sustained": "tsx tests/sustained.test.ts",
     "test": "tsx tests/vertical.test.ts --quick --tiers=20"
   },
   "dependencies": {
