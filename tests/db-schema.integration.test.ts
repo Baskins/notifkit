@@ -8,13 +8,14 @@ import { promisify } from "util";
 import postgres from "postgres";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import type { StartedPostgreSqlContainer } from "@testcontainers/postgresql";
+import type * as Migrator from "drizzle-orm/postgres-js/migrator";
 import {
   assertTablesInSchema,
   createDatabase,
   migrateDatabase,
   notifkitTableNames,
   runMigrations,
-} from "./index.js";
+} from "@/db/index.js";
 
 // When set, every retargeted migration file is passed through this function
 // right before drizzle applies it, to simulate the retargeting going wrong.
@@ -23,7 +24,7 @@ const sabotage = vi.hoisted(() => ({
 }));
 
 vi.mock("drizzle-orm/postgres-js/migrator", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("drizzle-orm/postgres-js/migrator")>();
+  const actual = await importOriginal<typeof Migrator>();
   return {
     ...actual,
     migrate: async (...args: Parameters<typeof actual.migrate>) => {
@@ -54,7 +55,7 @@ async function sabotaged<T>(rewrite: (sql: string) => string, run: () => Promise
 }
 
 const execFileAsync = promisify(execFile);
-const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
+const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const migrateCli = path.join(root, "scripts", "migrate.mjs");
 const builtPackage = path.join(root, "dist", "index.mjs");
 const cliIsBuilt =
@@ -107,9 +108,9 @@ async function inspect(url: string, schema: string) {
       WHERE table_schema = ${schema} AND table_name <> '__drizzle_migrations'
       ORDER BY table_name`;
     const journalSchema = schema === "public" ? "drizzle" : schema;
-    const [{ count }] = await sql<{ count: number }[]>`
+    const [row] = await sql<{ count: number }[]>`
       SELECT count(*)::int AS count FROM ${sql(journalSchema)}.__drizzle_migrations`;
-    return { tables: tables.map((t) => t.table_name), journal: count };
+    return { tables: tables.map((t) => t.table_name), journal: row!.count };
   } finally {
     await sql.end();
   }

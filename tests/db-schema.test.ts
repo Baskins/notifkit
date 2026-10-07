@@ -2,9 +2,9 @@ import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
 import { describe, expect, it } from "vitest";
-import { notifkitTableNames, qualifyMigrationSql } from "./index.js";
+import { notifkitTableNames, qualifyMigrationSql } from "@/db/index.js";
 
-const drizzleFolder = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../drizzle");
+const drizzleFolder = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../drizzle");
 const journal = JSON.parse(
   fs.readFileSync(path.join(drizzleFolder, "meta", "_journal.json"), "utf8"),
 ) as { entries: { tag: string }[] };
@@ -51,7 +51,7 @@ describe("notifkitTableNames", () => {
 });
 
 describe("notifkit-migrate packaging", () => {
-  const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
+  const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
   const pkg = JSON.parse(fs.readFileSync(path.join(root, "package.json"), "utf8")) as {
     bin: Record<string, string>;
     files: string[];
